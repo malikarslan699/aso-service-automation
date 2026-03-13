@@ -1,0 +1,24 @@
+Project Progress
+███████████░ 95%
+
+Completed:
+✓ Added `Suggestion.extra_data` support in model for review metadata persistence
+✓ Added Alembic migration `008` to add `extra_data` and safely block legacy review replies missing `review_id`
+✓ Persisted review reply `review_id` metadata during pipeline suggestion creation
+✓ Hardened Google review reply publish flow to block missing/invalid `review_id` before API calls
+✓ Hardened listing publish flow with dynamic default-language resolution and required-title pre-checks
+✓ Standardized Google publish error mapping (`missing_review_id`, `missing_default_language_title`, `google_api_not_found`, `google_api_forbidden`)
+✓ Improved blocked vs failed state handling in publish workers and listing bundle dispatcher
+✓ Extended suggestions API visibility with `publish_error_code`, `review_id`, and review `extra_data`
+✓ Added focused regression tests for new publish safeguards and status behavior
+✓ Full backend regression passed (`115 passed`)
+
+Remaining:
+□ Live-safe validation attempt against real Google Play credentials (env currently has empty `GOOGLE_SERVICE_ACCOUNT_JSON`)
+□ Optional end-to-end publish check on deployed environment after credentials are confirmed
+
+Current blocker:
+- Live credential is not configured in local `.env`, so direct live publish smoke cannot be executed safely from this environment.
+
+Last updated:
+- $(date -u '+%Y-%m-%d %H:%M:%S UTC')

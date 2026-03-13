@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install -r requirements.txt aiosqlite)",
+      "Bash(pip install --break-system-packages -r /srv/workspace/ASO-Service/requirements.txt aiosqlite)",
+      "Bash(python -m pytest tests/ -v)",
+      "Bash(python3 -m pytest tests/ -v)",
+      "Bash(find /srv/workspace/ASO-Service -name \"*.py\" -type f -exec wc -l {} +)",
+      "Bash(wc -l /srv/workspace/ASO-Service/tests/*.py)",
+      "Bash(wc -l /srv/workspace/ASO-Service/app/**/*.py)",
+      "Bash(python3 -c \"import sys,json; data=json.load\\(sys.stdin\\); print\\(data[0][''text'']\\)\")",
+      "Bash(python3 -c \":*)",
+      "Bash(pip install aiosqlite pytest-asyncio httpx --quiet)",
+      "Bash(python -m pytest tests/test_auth.py tests/test_apps.py tests/test_safety.py tests/test_keywords.py tests/test_pipeline.py -v --tb=short)",
+      "Bash(pip3 install aiosqlite --break-system-packages -q)",
+      "Bash(python3 -m pytest tests/test_safety.py tests/test_keywords.py tests/test_pipeline.py -v --tb=short)",
+      "Bash(python3 -m pytest tests/test_auth.py tests/test_apps.py -v --tb=short)",
+      "Bash(npm install --legacy-peer-deps)",
+      "Bash(npx tsc --noEmit)",
+      "Bash(npx vite build)"
+    ]
+  }
+}

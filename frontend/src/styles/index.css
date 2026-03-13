@@ -1,0 +1,104 @@
+@import url("https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap");
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 42 43% 97%;
+    --foreground: 214 44% 16%;
+    --card: 0 0% 100%;
+    --card-foreground: 214 44% 16%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 214 44% 16%;
+    --primary: 212 89% 45%;
+    --primary-foreground: 210 40% 98%;
+    --secondary: 44 63% 93%;
+    --secondary-foreground: 214 44% 16%;
+    --muted: 210 33% 95%;
+    --muted-foreground: 218 17% 42%;
+    --accent: 198 71% 93%;
+    --accent-foreground: 214 44% 16%;
+    --destructive: 0 77% 57%;
+    --destructive-foreground: 210 40% 98%;
+    --border: 210 23% 86%;
+    --input: 210 23% 86%;
+    --ring: 212 89% 45%;
+    --radius: 1rem;
+    --sidebar: 0 0% 100%;
+    --sidebar-foreground: 214 44% 16%;
+    --sidebar-border: 210 23% 88%;
+  }
+
+  .dark {
+    --background: 217 35% 9%;
+    --foreground: 44 29% 92%;
+    --card: 220 29% 12%;
+    --card-foreground: 44 29% 92%;
+    --popover: 220 29% 12%;
+    --popover-foreground: 44 29% 92%;
+    --primary: 190 87% 55%;
+    --primary-foreground: 220 39% 10%;
+    --secondary: 219 25% 18%;
+    --secondary-foreground: 44 29% 92%;
+    --muted: 219 24% 16%;
+    --muted-foreground: 214 17% 70%;
+    --accent: 219 24% 18%;
+    --accent-foreground: 44 29% 92%;
+    --destructive: 0 78% 60%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 219 19% 22%;
+    --input: 219 19% 22%;
+    --ring: 190 87% 55%;
+    --sidebar: 220 31% 10%;
+    --sidebar-foreground: 44 29% 92%;
+    --sidebar-border: 219 19% 22%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  html {
+    min-height: 100%;
+    min-height: 100dvh;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+    font-feature-settings: "rlig" 1, "calt" 1;
+    font-family: "IBM Plex Sans", sans-serif;
+    min-height: 100vh;
+    min-height: 100dvh;
+    background-image:
+      radial-gradient(circle at top left, hsl(var(--secondary)) 0, transparent 26%),
+      radial-gradient(circle at top right, hsl(var(--accent)) 0, transparent 24%),
+      linear-gradient(180deg, hsl(var(--background)), hsl(var(--background)));
+  }
+
+  h1,
+  h2,
+  h3,
+  h4,
+  h5,
+  h6 {
+    font-family: "Space Grotesk", sans-serif;
+    letter-spacing: -0.03em;
+  }
+}
+
+@layer utilities {
+  .panel {
+    @apply rounded-2xl border border-border/80 bg-card/90 shadow-[0_20px_60px_-30px_rgba(15,23,42,0.35)] backdrop-blur;
+  }
+
+  .soft-grid {
+    background-image:
+      linear-gradient(to right, rgba(148, 163, 184, 0.08) 1px, transparent 1px),
+      linear-gradient(to bottom, rgba(148, 163, 184, 0.08) 1px, transparent 1px);
+    background-size: 28px 28px;
+  }
+}

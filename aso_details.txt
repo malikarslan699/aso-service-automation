@@ -1,0 +1,496 @@
+Context
+AI-powered ASO automation for com.NetSafe.VPN on Google Play.
+Goal: Simple, user-friendly, authentic results. No over-engineering.
+
+Architecture Change: Multi-App + Admin Login
+New Design: One Panel → Multiple Apps
+Admin Login → Select App → Manage ASO
+                ↓
+         App 1: com.NetSafe.VPN
+         App 2: com.NewApp.xyz  (future)
+         App 3: com.AnotherApp  (future)
+How It Works:
+
+One deployment — one server, one URL
+Admin login protects everything
+Global settings (shared): Anthropic API key, Telegram
+Per-app settings: Play Console credentials, package name, app facts
+All data is per-app: suggestions, keywords, metrics, reviews
+Bug fix rule: Core service fix → applies to ALL apps automatically
+
+Users & Roles:
+admin  → full access, all apps, settings
+viewer → read-only, assigned apps only
+
+Analysis: What's Valid vs Overkill
+3 New Suggestions — My Verdict:
+SuggestionValid?DecisionIP consistency layer❌ NOT NEEDEDSystem uses Google Play API (service account), not browser login. API calls have no IP restrictions. Skip this.Secrets Vault (AWS/HashiCorp)⚠️ OverkillHetzner server pe simple Docker secrets + encrypted .env kaafi hai. AWS Secrets Manager is over-engineering for one app.Rate limiter: max 1 publish/day✅ VALIDSimple, important protection. Add it.
+5 Dangerous Mistakes — Already Covered?
+MistakeAlready in Plan?ActionKeyword stuffing✅ Layer C rulesKeep as-isUnsupported security claims✅ Layer A + App FactsKeep as-isCompetitor brand names✅ Layer A blocklistKeep as-isToo frequent changes✅ Human simulator cadenceKeep as-isFake review manipulation✅ Safety rulesKeep as-is
+These 5 are already handled. No new work needed.
+What I'm Removing (Over-Engineering):
+
+❌ IP consistency layer (not applicable to API auth)
+❌ A/B experiments table (not needed for MVP)
+❌ Prompt versioning table (nice-to-have, not core)
+❌ AWS/Vault secrets (overkill for single app)
+❌ Complex attribution confidence algorithm (keep simple)
+❌ publish_events table (merge into suggestions)
+
+
+Final Simplified Stack
+LayerChoiceWhyBackendPython + FastAPISimple, fastAIClaude API claude-sonnet-4-6Best for this use caseQueueCelery + RedisReliableDBPostgreSQLStructured, auditableDataGoogle Play API (free)Official, no costKeywordsSerpAPI (optional, UI-configurable)Add laterNotificationsTelegram Bot (free)Instant phone alertsFrontendReact + TailwindClean dashboardDeployDocker + docker-compose on HetznerAlready have serverSecretsDocker secrets + encrypted DB configSimple, sufficient
+
+Project Structure (Simplified)
+/srv/workspace/ASO-Service/
+├── docker-compose.yml
+├── Dockerfile
+├── requirements.txt
+├── Final_ASOPlan.md                  ← Will be created now
+├── .env.example
+├── .gitignore
+├── Makefile
+│
+├── secrets/                          ← gitignored
+│   └── service_account.json
+│
+├── alembic/
+│   └── versions/001_initial.py
+├── alembic.ini
+│
+├── app/
+│   ├── main.py
+│   ├── config.py
+│   ├── dependencies.py
+│   │
+│   ├── api/v1/
+│   │   ├── router.py
+│   │   ├── dashboard.py
+│   │   ├── approvals.py
+│   │   ├── pipeline.py
+│   │   ├── keywords.py
+│   │   ├── metrics.py
+│   │   ├── reviews.py
+│   │   ├── app_facts.py
+│   │   ├── settings.py               ← UI se API keys manage
+│   │   ├── notifications.py
+│   │   └── logs.py
+│   │
+│   ├── models/                       ← 11 tables only
+│   │   ├── suggestion.py
+│   │   ├── app_listing.py
+│   │   ├── keyword.py
+│   │   ├── pipeline_run.py
+│   │   ├── review_reply.py
+│   │   ├── policy_cache.py
+│   │   ├── app_facts.py
+│   │   ├── auto_approve_rule.py
+│   │   ├── notification.py
+│   │   ├── system_log.py
+│   │   └── system_config.py          ← UI-managed settings
+│   │
+│   ├── services/
+│   │   ├── data_fetcher.py           ← Google Play API
+│   │   ├── keyword_engine.py         ← SerpAPI if key exists, else basic
+│   │   ├── ai_engine.py              ← Claude API
+│   │   ├── policy_engine.py          ← Weekly policy refresh
+│   │   ├── safety_validator.py       ← 3 layers combined
+│   │   ├── human_simulator.py        ← Delays + timing
+│   │   ├── execution.py              ← Publish + rate limit
+│   │   ├── performance_tracker.py    ← Before/after metrics
+│   │   ├── auto_approve_engine.py    ← Learning system
+│   │   └── notifier.py               ← Telegram
+│   │
+│   └── workers/
+│       ├── celery_app.py
+│       ├── dynamic_scheduler.py      ← Random window, no fixed time
+│       └── tasks/
+│           ├── daily_pipeline.py
+│           ├── refresh_policies.py
+│           └── track_performance.py
+│
+├── frontend/
+│   └── src/
+│       ├── pages/
+│       │   ├── Dashboard.tsx         ← Status + health + timeline
+│       │   ├── Approvals.tsx         ← Diff view + approve/reject
+│       │   ├── Keywords.tsx
+│       │   ├── Reviews.tsx
+│       │   ├── Metrics.tsx
+│       │   ├── AppFacts.tsx          ← Edit verified VPN features
+│       │   ├── Settings.tsx          ← All API keys via UI
+│       │   └── Logs.tsx              ← Admin: system errors
+│       ├── components/
+│       │   ├── Layout.tsx            ← Responsive sidebar/bottom nav
+│       │   ├── MobileNav.tsx         ← Bottom navigation for mobile
+│       │   └── ...
+│       └── styles/
+│           └── index.css             ← Tailwind + mobile-first
+│
+└── tests/
+    ├── test_safety.py
+    ├── test_pipeline.py
+    └── test_auto_approve.py
+
+Multi-App Database Design
+New Core Tables:
+apps — Registered apps
+id | name | package_name | store (google_play|app_store)
+status (active|paused) | created_at
+Example:
+  "NetSafe VPN"  | com.NetSafe.VPN  | google_play | active
+  "MyNewApp"     | com.MyNewApp.xyz | google_play | active
+app_credentials — Per-app secrets
+id | app_id | credential_type (service_account_json|api_key)
+value (encrypted) | updated_at
+users — Admin login
+id | username | email | hashed_password | role (admin|viewer)
+is_active | created_at
+global_config — Shared settings (Anthropic, Telegram)
+key | value (encrypted) | description | updated_at
+Examples:
+  anthropic_api_key | sk-ant-*** | Claude API
+  telegram_bot_token | ***      | Notifications
+  telegram_chat_id   | ***      | Chat ID
+All other tables get app_id column — data is always scoped to one app.
+Table with app_id:
+suggestions (app_id) | app_listings (app_id) | keywords (app_id)
+pipeline_runs (app_id) | review_replies (app_id) | app_facts (app_id)
+auto_approve_rules (app_id) | notifications (app_id)
+Total Tables: 13
+apps, app_credentials, users, global_config, suggestions, app_listings, keywords, pipeline_runs, review_replies, policy_cache, app_facts, auto_approve_rules, notifications, system_logs
+
+11 Database Tables (Lean)
+TablePurposesuggestionsAI-generated changes + statusapp_listingsDaily snapshots (before/after publish)keywordsKeyword tracking + opportunitiespipeline_runsDaily run logsreview_repliesReview reply draftspolicy_cacheGoogle Play VPN policies (cached)app_factsVerified NetSafe VPN featuresauto_approve_rulesLearning rules per typenotificationsIn-app alertssystem_logsBackend errors (admin only)system_configUI-managed API keys + settings
+
+Safety Validator (Combined, Simple)
+Layer A — Hard Block:
+  anonymous, unhackable, 100% secure, hack-proof,
+  bypass government, military-grade (no proof),
+  NordVPN, ExpressVPN, Surfshark (competitor brands)
+
+Layer B — Evidence Check:
+  Any claim → check app_facts table
+  Not in app_facts → FLAG for human review
+
+Layer C — Behavior:
+  Same keyword > 3x → reject
+  Title > 50 chars → reject
+  > 1 metadata change today → hold
+  > 5 metadata changes this week → hold
+
+Rate Limiter (Publish Protection)
+python# execution.py
+MAX_PUBLISH_PER_DAY = 1
+MAX_PUBLISH_PER_WEEK = 5
+
+# Before every publish:
+today_count = count_publishes_today()
+week_count = count_publishes_this_week()
+
+if today_count >= MAX_PUBLISH_PER_DAY:
+    → hold, notify: "Daily limit reached"
+if week_count >= MAX_PUBLISH_PER_WEEK:
+    → hold, notify: "Weekly limit reached"
+```
+
+---
+
+## Human Simulation Rules
+```
+Scheduling:
+  Random time between 9 AM – 10 PM
+  Never same hour 2 days in a row
+  2 random skip days per week (natural)
+
+Cadence per type:
+  Review replies:   same day OK
+  Short desc:       max 1x per 2 weeks
+  Long desc:        max 1x per 3 weeks
+  Title:            max 1x per month
+
+Delays between actions:
+  5–20 min between pipeline steps
+  45 min – 3 hours between publish actions
+```
+
+---
+
+## Admin Login + Multi-App UI Flow
+
+### Login Page
+```
+┌──────────────────────────────┐
+│      ASO Manager             │
+│                              │
+│  Username: [admin          ] │
+│  Password: [••••••••••••   ] │
+│                              │
+│        [Login]               │
+└──────────────────────────────┘
+```
+
+### App Selector (After Login)
+```
+┌──────────────────────────────────────┐
+│ ASO Manager          👤 Admin  [logout]│
+├──────────────────────────────────────┤
+│ Your Apps:                           │
+│                                      │
+│ [🟢 NetSafe VPN] [+ Add New App]     │
+│  com.NetSafe.VPN                     │
+│  Last run: 2 hrs ago                 │
+│  3 pending approvals                 │
+└──────────────────────────────────────┘
+```
+
+### Per-App Settings Page
+```
+Settings → App: NetSafe VPN
+  Package:         com.NetSafe.VPN
+  Play Console SA: [uploaded ✅]
+  DRY_RUN:         [ON] ← toggle
+  Max publish/day: [1]
+
+Settings → Global (shared all apps)
+  Anthropic API:   [sk-ant-***] ✅
+  Telegram Token:  [bot***]    ✅
+  Telegram Chat:   [123***]    ✅
+  SerpAPI:         [empty]     ⚪
+
+Settings → Users
+  admin  | admin@you.com | Admin role
+  [+ Add User]
+```
+
+### Add New App Flow
+```
+[+ Add New App]
+  1. App Name: ___________
+  2. Package Name: com.___
+  3. Upload Service Account JSON
+  4. [Create App]
+  → App added, pipeline ready to run
+```
+
+---
+
+## Settings Page (UI) — No Restart Needed
+```
+Settings → API Keys:
+  Claude API Key       [••••••••]  ✅
+  Google SA JSON       [uploaded]  ✅
+  Telegram Bot Token   [••••••••]  ✅
+  SerpAPI Key          [empty]     ⚪ (add when ready)
+
+Settings → Limits:
+  Max publish/day      [1]
+  Max publish/week     [5]
+  Auto-approve threshold [1]
+
+Settings → Dry Run:
+  [ON] ← Start here, flip OFF when ready
+```
+
+All saved to `system_config` table (encrypted values).
+
+---
+
+## UI — Responsive Design Rules
+
+### Mobile-First (Phone + Tablet + Desktop sab pe kaam kare)
+```
+Phone (< 768px):
+  - Bottom navigation bar (5 icons)
+  - Cards stacked vertically
+  - Big approve/reject buttons (thumb-friendly)
+  - Swipe left = reject, swipe right = approve
+
+Tablet (768px – 1024px):
+  - Side navigation (collapsible)
+  - 2-column card grid
+
+Desktop (> 1024px):
+  - Sidebar always visible
+  - Multi-column layout
+  - Keyboard shortcuts (A = approve, R = reject)
+```
+
+### Simple Language in UI
+```
+❌ "Pipeline execution initiated"
+✅ "Running daily check..."
+
+❌ "Suggestion pending approval queue"
+✅ "3 changes waiting for your review"
+
+❌ "Metadata variant risk coefficient: 4.2"
+✅ "Medium risk — review before publishing"
+```
+
+### Dashboard Mobile View
+```
+┌─────────────────────┐
+│ NetSafe VPN ASO  🔔3│
+├─────────────────────┤
+│ 🟢 System Running   │
+│ Last run: 2 hrs ago │
+├─────────────────────┤
+│ 3 waiting for you   │
+│ [Review Now →]      │
+├─────────────────────┤
+│ This week: +8%      │
+│ installs ↑          │
+├──┬──┬──┬──┬─────────┤
+│🏠│✅│🔑│📊│⚙️       │
+└──┴──┴──┴──┴─────────┘
+ Home Approv Keys Stats Settings
+```
+
+### Approval Card (Mobile — Simple)
+```
+┌──────────────────────┐
+│ Title Change  ⚠️ Med │
+├──────────────────────┤
+│ OLD:                 │
+│ NetSafe VPN: Fast    │
+│                      │
+│ NEW:                 │
+│ NetSafe VPN – Private│
+│ & Fast Proxy         │
+│                      │
+│ Why: Adds 'proxy'    │
+│ keyword (32K/month)  │
+│                      │
+│ Safety: ✅ OK        │
+├──────────┬───────────┤
+│ ✅ YES   │  ❌ NO    │
+└──────────┴───────────┘
+```
+
+### Tech for Responsive UI
+- **React + Tailwind CSS** (mobile-first classes)
+- **shadcn/ui** components (pre-built, accessible, responsive)
+- **Recharts** for metrics charts (mobile-responsive)
+- No heavy libraries — fast loading
+
+---
+
+## Daily Pipeline Flow
+```
+Step 1: Fetch data (Google Play API)
+Step 2: Keyword analysis
+Step 3: Claude generates suggestions
+Step 4: Safety validation (3 layers)
+Step 5: Store suggestions with risk scores
+Step 6: Auto-publish risk 0-1 (review replies only initially)
+Step 7: Notify human for risk 2+
+Step 8: [7 days later] Performance check
+Step 9: Rollback if metrics drop
+```
+
+---
+
+## Launch Sequence
+```
+Week 1-2:  Settings → DRY_RUN = ON
+           Everything runs but nothing publishes
+           Review AI suggestion quality
+
+Week 3:    DRY_RUN = OFF
+           Only review replies (risk 0-1)
+           Watch Telegram alerts
+
+Week 4+:   Add short_desc if results good
+           Let auto-approve learning work
+```
+
+---
+
+## App Facts (Fill These for NetSafe VPN)
+```
+fact_key              fact_value         verified
+─────────────────────────────────────────────────
+encryption_type       AES-256-GCM        ?
+kill_switch           yes/no             ?
+no_logs_audited       yes/no             ?
+server_count          ?                  ?
+server_locations      ?                  ?
+protocol_used         OpenVPN/WireGuard  ?
+You fill these in Settings → App Facts page.
+
+Environment Variables (.env.example)
+bash# Required
+ANTHROPIC_API_KEY=sk-ant-...
+GOOGLE_SERVICE_ACCOUNT_JSON=/run/secrets/service_account
+GOOGLE_PLAY_PACKAGE_NAME=com.NetSafe.VPN
+DATABASE_URL=postgresql://aso_user:pass@postgres:5432/aso_db
+REDIS_URL=redis://redis:6379/0
+
+# Optional (also manageable via UI Settings)
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
+SERPAPI_KEY=
+
+# Defaults (overridable via UI)
+DRY_RUN=true
+MAX_PUBLISH_PER_DAY=1
+MAX_PUBLISH_PER_WEEK=5
+AUTO_APPROVE_THRESHOLD=1
+```
+
+---
+
+## requirements.txt (for /srv/workspace/ASO-Service)
+```
+fastapi==0.115.0
+uvicorn[standard]==0.30.0
+pydantic==2.7.0
+pydantic-settings==2.3.0
+sqlalchemy==2.0.30
+alembic==1.13.2
+asyncpg==0.29.0
+psycopg2-binary==2.9.9
+celery==5.4.0
+redis==5.0.7
+anthropic==0.34.0
+google-auth==2.32.0
+google-api-python-client==2.143.0
+httpx==0.27.0
+aiohttp==3.10.0
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+python-multipart==0.0.9
+python-telegram-bot==21.4
+cryptography==43.0.0
+structlog==24.4.0
+python-dotenv==1.0.1
+tenacity==8.5.0
+pytest==8.3.2
+pytest-asyncio==0.24.0
+httpx==0.27.0
+```
+
+---
+
+## Files to Create NOW (2 Files)
+
+1. `/srv/workspace/ASO-Service/Final_ASOPlan.md` — This document
+2. `/srv/workspace/ASO-Service/requirements.txt` — Python dependencies above
+
+---
+
+## Module Fix Map (For Future Issues)
+```
+Keyword research broken   → services/keyword_engine.py
+AI suggestions bad        → services/ai_engine.py
+Safety blocking too much  → services/safety_validator.py (Layer A/B/C)
+Pipeline not running      → workers/tasks/daily_pipeline.py
+Publish not working       → services/execution.py
+Auto-approve off          → services/auto_approve_engine.py
+Telegram silent           → services/notifier.py
+UI page broken            → frontend/src/pages/<Page>.tsx
+API endpoint error        → api/v1/<endpoint>.py
+Settings not saving       → api/v1/settings.py + system_config table
+Schedule wrong timing     → workers/dynamic_scheduler.py
+Policy stale              → workers/tasks/refresh_policies.py

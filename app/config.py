@@ -1,10 +1,13 @@
-from pydantic_settings import BaseSettings
 from functools import lru_cache
+from pydantic import model_validator
+from pydantic_settings import BaseSettings
+
+DEFAULT_SECRET_KEY = "change-me-to-a-random-string"
 
 
 class Settings(BaseSettings):
     # Core
-    secret_key: str = "change-me-to-a-random-string"
+    secret_key: str = DEFAULT_SECRET_KEY
     database_url: str = "postgresql+asyncpg://aso_user:aso_pass@postgres:5432/aso_db"
     database_url_sync: str = "postgresql://aso_user:aso_pass@postgres:5432/aso_db"
     redis_url: str = "redis://redis:6379/0"
@@ -25,10 +28,19 @@ class Settings(BaseSettings):
     max_publish_per_week: int = 5
     auto_approve_threshold: int = 1
 
+    # CORS — set to your production domain(s), comma-separated
+    allowed_origins: str = "*"
+
     # JWT
     access_token_expire_minutes: int = 60 * 24  # 24 hours
 
     model_config = {"env_file": ".env", "extra": "ignore"}
+
+    @model_validator(mode="after")
+    def validate_production_secret_key(self):
+        if not self.dry_run and self.secret_key == DEFAULT_SECRET_KEY:
+            raise ValueError("SECRET_KEY must be changed from default when DRY_RUN=false.")
+        return self
 
 
 @lru_cache

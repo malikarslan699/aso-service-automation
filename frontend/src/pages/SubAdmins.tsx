@@ -237,7 +237,7 @@ export function SubAdmins() {
                             key={project.id}
                             className="rounded-full bg-secondary px-2.5 py-1 text-xs font-medium text-secondary-foreground"
                           >
-                            {project.name}
+                            {project.name} · Assigned by Admin
                           </span>
                         ))
                       ) : (

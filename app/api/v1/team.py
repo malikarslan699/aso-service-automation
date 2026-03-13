@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import select, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.security import hash_password
@@ -49,12 +49,25 @@ async def _get_sub_admin_or_404(db: AsyncSession, user_id: int) -> User:
     return target
 
 
-async def _validate_app_ids(db: AsyncSession, app_ids: list[int]) -> list[App]:
+async def _validate_app_ids(db: AsyncSession, app_ids: list[int], actor: User | None = None) -> list[App]:
     if not app_ids:
         return []
-    apps = (await db.execute(select(App).where(App.id.in_(app_ids)).order_by(App.name.asc()))).scalars().all()
+    query = select(App).where(App.id.in_(app_ids)).order_by(App.name.asc())
+    if actor and actor.role in {"admin", "sub_admin"}:
+        query = (
+            select(App)
+            .outerjoin(
+                UserAppAccess,
+                (UserAppAccess.app_id == App.id) & (UserAppAccess.user_id == actor.id),
+            )
+            .where(App.id.in_(app_ids))
+            .where(or_(App.owner_user_id == actor.id, UserAppAccess.user_id == actor.id))
+            .order_by(App.name.asc())
+            .distinct()
+        )
+    apps = (await db.execute(query)).scalars().all()
     if len(apps) != len(set(app_ids)):
-        raise HTTPException(status_code=400, detail="One or more apps were not found")
+        raise HTTPException(status_code=400, detail="One or more apps were not found or are not accessible")
     return apps
 
 
@@ -136,7 +149,7 @@ async def create_sub_admin(
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=400, detail="Username already exists")
 
-    apps = await _validate_app_ids(db, body.app_ids)
+    apps = await _validate_app_ids(db, body.app_ids, actor=user)
 
     sub_admin = User(
         username=username,
@@ -174,7 +187,7 @@ async def update_sub_admin(
         target.email = _normalize_optional_email(body.email)
 
     if body.app_ids is not None:
-        apps = await _validate_app_ids(db, body.app_ids)
+        apps = await _validate_app_ids(db, body.app_ids, actor=user)
         await _replace_user_access(db, target.id, apps)
 
     await db.commit()
@@ -189,7 +202,7 @@ async def update_sub_admin_assignments(
     user: User = Depends(require_role("admin")),
 ):
     target = await _get_sub_admin_or_404(db, user_id)
-    apps = await _validate_app_ids(db, body.app_ids)
+    apps = await _validate_app_ids(db, body.app_ids, actor=user)
     await _replace_user_access(db, target.id, apps)
     await db.commit()
     return {"status": "ok", "user_id": target.id, "app_ids": sorted(body.app_ids)}

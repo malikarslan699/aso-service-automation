@@ -44,6 +44,13 @@ type IntegrationItem = {
   } | null
 }
 
+type AppCredentialStatus = {
+  app_id: number
+  service_account_json: boolean
+  anthropic_api_key: boolean
+  openai_api_key: boolean
+}
+
 const INTEGRATION_FIELDS: Record<
   string,
   {
@@ -252,6 +259,7 @@ export function Settings() {
   const [editingControl, setEditingControl] = useState<string | null>(null)
   const [providerDrafts, setProviderDrafts] = useState<Record<string, Record<string, string>>>({})
   const [controlDrafts, setControlDrafts] = useState<Record<string, string>>({})
+  const [projectKeyDrafts, setProjectKeyDrafts] = useState({ anthropic_api_key: "", openai_api_key: "" })
 
   const { data: configs = [], isLoading } = useQuery<ConfigItem[]>({
     queryKey: ["settings"],
@@ -264,6 +272,14 @@ export function Settings() {
       api
         .get("/api/v1/settings/integrations/status", { params: { app_id: selectedApp?.id } })
         .then((response) => response.data.integrations || []),
+  })
+  const { data: appCredentialStatus } = useQuery<AppCredentialStatus | null>({
+    queryKey: ["app-credential-status", selectedApp?.id],
+    queryFn: () =>
+      api
+        .get(`/api/v1/apps/${selectedApp?.id}/credentials/status`)
+        .then((response) => response.data),
+    enabled: !!selectedApp,
   })
 
   const configMap = useMemo(() => new Map(configs.map((item) => [item.key, item])), [configs])
@@ -320,6 +336,25 @@ export function Settings() {
     },
   })
 
+  const saveProjectAiKeys = useMutation({
+    mutationFn: async () => {
+      if (!selectedApp) throw new Error("Select a project first")
+      await api.put(`/api/v1/apps/${selectedApp.id}/credentials/text`, {
+        credential_type: "anthropic_api_key",
+        value: projectKeyDrafts.anthropic_api_key,
+      })
+      await api.put(`/api/v1/apps/${selectedApp.id}/credentials/text`, {
+        credential_type: "openai_api_key",
+        value: projectKeyDrafts.openai_api_key,
+      })
+    },
+    onSuccess: () => {
+      setProjectKeyDrafts({ anthropic_api_key: "", openai_api_key: "" })
+      qc.invalidateQueries({ queryKey: ["app-credential-status"] })
+      qc.invalidateQueries({ queryKey: ["integration-status"] })
+    },
+  })
+
   if (isLoading) return <div className="text-muted-foreground">Loading...</div>
 
   const controlValues = CONTROL_FIELDS.map((field) => ({
@@ -360,6 +395,54 @@ export function Settings() {
           <p className="mt-1 text-sm text-muted-foreground">
             Edit keys from these cards only. Health turns green only when real inference works.
           </p>
+        </div>
+
+        <div className="panel p-5 space-y-4">
+          <div>
+            <h3 className="text-lg font-semibold">Project AI Keys (Optional Override)</h3>
+            <p className="text-sm text-muted-foreground mt-1">
+              If set, this project will use its own API keys instead of shared global keys.
+            </p>
+          </div>
+          <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+            <input
+              type="password"
+              value={projectKeyDrafts.anthropic_api_key}
+              onChange={(event) => setProjectKeyDrafts((current) => ({ ...current, anthropic_api_key: event.target.value }))}
+              placeholder="Project Claude API key (leave empty to clear)"
+              className="w-full rounded-2xl border border-input bg-background px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+            />
+            <input
+              type="password"
+              value={projectKeyDrafts.openai_api_key}
+              onChange={(event) => setProjectKeyDrafts((current) => ({ ...current, openai_api_key: event.target.value }))}
+              placeholder="Project OpenAI key (optional)"
+              className="w-full rounded-2xl border border-input bg-background px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+            />
+          </div>
+          <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+            <span className={`rounded-full px-2.5 py-1 ${appCredentialStatus?.anthropic_api_key ? "bg-green-500/10 text-green-700" : "bg-amber-500/10 text-amber-700"}`}>
+              Claude key: {appCredentialStatus?.anthropic_api_key ? "Project override enabled" : "Using global key"}
+            </span>
+            <span className={`rounded-full px-2.5 py-1 ${appCredentialStatus?.openai_api_key ? "bg-green-500/10 text-green-700" : "bg-amber-500/10 text-amber-700"}`}>
+              OpenAI key: {appCredentialStatus?.openai_api_key ? "Project override enabled" : "Using global key"}
+            </span>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={() => saveProjectAiKeys.mutate()}
+              disabled={saveProjectAiKeys.isPending || !selectedApp}
+              className="rounded-2xl bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-50"
+            >
+              {saveProjectAiKeys.isPending ? "Saving..." : "Save Project AI Keys"}
+            </button>
+          </div>
+          {saveProjectAiKeys.isError && (
+            <p className="text-sm text-destructive">
+              Failed: {extractErrorMessage(saveProjectAiKeys.error, "Could not save project AI keys")}
+            </p>
+          )}
         </div>
 
         <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">

@@ -45,8 +45,6 @@ def require_any_role(*roles: str):
 
 
 async def user_has_app_access(db: AsyncSession, user: User, app_id: int) -> bool:
-    if user.role == "admin":
-        return True
     app_result = await db.execute(select(App).where(App.id == app_id))
     app = app_result.scalar_one_or_none()
     if app is None:

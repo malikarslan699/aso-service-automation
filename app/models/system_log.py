@@ -1,4 +1,4 @@
-from sqlalchemy import String, Text
+from sqlalchemy import String, Text, Integer
 from sqlalchemy.orm import Mapped, mapped_column
 from app.models.base import Base, TimestampMixin
 
@@ -11,3 +11,4 @@ class SystemLog(Base, TimestampMixin):
     module: Mapped[str] = mapped_column(String(100))
     message: Mapped[str] = mapped_column(Text)
     details: Mapped[str] = mapped_column(Text, default="")
+    app_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)

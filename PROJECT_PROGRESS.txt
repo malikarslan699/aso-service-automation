@@ -1,24 +1,22 @@
 Project Progress
-███████████░ 95%
+███████████░ 92%
 
 Completed:
-✓ Added `Suggestion.extra_data` support in model for review metadata persistence
-✓ Added Alembic migration `008` to add `extra_data` and safely block legacy review replies missing `review_id`
-✓ Persisted review reply `review_id` metadata during pipeline suggestion creation
-✓ Hardened Google review reply publish flow to block missing/invalid `review_id` before API calls
-✓ Hardened listing publish flow with dynamic default-language resolution and required-title pre-checks
-✓ Standardized Google publish error mapping (`missing_review_id`, `missing_default_language_title`, `google_api_not_found`, `google_api_forbidden`)
-✓ Improved blocked vs failed state handling in publish workers and listing bundle dispatcher
-✓ Extended suggestions API visibility with `publish_error_code`, `review_id`, and review `extra_data`
-✓ Added focused regression tests for new publish safeguards and status behavior
-✓ Full backend regression passed (`115 passed`)
+✓ User-reported issues triage complete (History delete, dashboard UX, visibility, logs, duplicate-filter trace)
+✓ Root-cause identified for History delete failure (terminal-state mismatch between frontend and backend checks)
+✓ History delete logic fixed (backend terminal evaluation now publish-state aware)
+✓ Approvals history delete button now respects backend `can_delete` state
+✓ Project visibility hardened: admins/sub-admins now see/access only own or explicitly assigned projects
+✓ Dashboard clarity improved (mode badges labeled as status + Claude billing CTA)
+✓ Header/sidebar UX cleanup (logo now routes to Dashboard, duplicate role text removed)
+✓ Duplicate-filter observability improved with reason breakdown in pipeline step log
+✓ Project-scoped logs implemented (`app_id`), Logs page now supports scoped clear action
+✓ Added project-level AI key override support (Claude/OpenAI per project + global fallback)
+✓ Sub-admin assignment table now labels assigned projects as `Assigned by Admin`
+✓ Targeted regression suite passed (`48 passed`)
+✓ Full backend regression suite passed (`129 passed`)
+✓ Frontend production build passed (`npm run build`)
 
 Remaining:
-□ Live-safe validation attempt against real Google Play credentials (env currently has empty `GOOGLE_SERVICE_ACCOUNT_JSON`)
-□ Optional end-to-end publish check on deployed environment after credentials are confirmed
-
-Current blocker:
-- Live credential is not configured in local `.env`, so direct live publish smoke cannot be executed safely from this environment.
-
-Last updated:
-- $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+□ Cross-role assignment workflow (sub-admin ↔ admin assignment UI/API flow) with explicit API-source popup policy
+□ True Claude wallet balance amount + `< $1` threshold alert (provider does not expose direct wallet balance in current integration)

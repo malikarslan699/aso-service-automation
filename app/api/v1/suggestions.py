@@ -4,7 +4,7 @@ import json
 from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, func
 from typing import Optional
 from app.database import get_db
 from app.dependencies import get_current_user, require_any_role, ensure_app_access, require_role
@@ -37,10 +37,6 @@ class RejectRequest(BaseModel):
     reason: str
 
 
-class PipelineTriggerRequest(BaseModel):
-    dry_run: bool = True
-
-
 class RetryPublishRequest(BaseModel):
     reason: Optional[str] = None
 
@@ -51,67 +47,93 @@ async def list_suggestions(
     status_filter: Optional[str] = Query(None, alias="status"),
     suggestion_type: Optional[str] = None,
     pipeline_run_id: Optional[int] = None,
+    paginated: bool = Query(False),
+    limit: int = Query(200, ge=1, le=500),
+    offset: int = Query(0, ge=0),
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
     """List suggestions for an app, with optional status and type filters."""
     await ensure_app_access(db, user, app_id)
-    query = select(Suggestion).where(Suggestion.app_id == app_id)
+    filters = [Suggestion.app_id == app_id]
 
     if status_filter:
-        query = query.where(Suggestion.status == status_filter)
+        filters.append(Suggestion.status == status_filter)
     if suggestion_type:
-        query = query.where(Suggestion.suggestion_type == suggestion_type)
+        filters.append(Suggestion.suggestion_type == suggestion_type)
     if pipeline_run_id is not None:
-        query = query.where(Suggestion.pipeline_run_id == pipeline_run_id)
+        filters.append(Suggestion.pipeline_run_id == pipeline_run_id)
 
-    query = query.order_by(Suggestion.pipeline_run_id.is_(None), Suggestion.pipeline_run_id.desc(), Suggestion.id.desc()).limit(200)
+    query = (
+        select(Suggestion)
+        .where(*filters)
+        .order_by(Suggestion.pipeline_run_id.is_(None), Suggestion.pipeline_run_id.desc(), Suggestion.id.desc())
+    )
+
+    if paginated:
+        count_query = select(func.count()).select_from(Suggestion).where(*filters)
+        total = (await db.execute(count_query)).scalar_one()
+        query = query.offset(offset).limit(limit)
+    else:
+        query = query.limit(200)
+
     result = await db.execute(query)
     suggestions = result.scalars().all()
 
-    payload = []
-    for s in suggestions:
-        status_log = hydrate_status_log(s)
-        response_status = build_publish_response_status(s)
-        extra_data = {}
-        try:
-            extra_data = json.loads(getattr(s, "extra_data", "{}") or "{}")
-        except Exception:
-            extra_data = {}
-        payload.append(
-            {
-                "id": s.id,
-                "pipeline_run_id": s.pipeline_run_id,
-                "suggestion_type": s.suggestion_type,
-                "field_name": s.field_name,
-                "old_value": s.old_value,
-                "new_value": s.new_value,
-                "reasoning": s.reasoning,
-                "risk_score": s.risk_score,
-                "status": s.status,
-                "review_status": response_status["review_status"],
-                "publish_status": response_status["publish_status"],
-                "publish_message": s.publish_message,
-                "publish_started_at": s.publish_started_at.isoformat() if s.publish_started_at else None,
-                "publish_completed_at": s.publish_completed_at.isoformat() if s.publish_completed_at else None,
-                "published_live": response_status["published_live"],
-                "is_dry_run_result": response_status["is_dry_run_result"],
-                "merged_into_job_id": s.merged_into_job_id,
-                "dispatch_window": s.dispatch_window,
-                "next_eligible_at": s.next_eligible_at.isoformat() if s.next_eligible_at else None,
-                "publish_block_reason": s.publish_block_reason,
-                "publish_error_code": _extract_publish_error_code(s.publish_message, s.publish_block_reason),
-                "review_id": extra_data.get("review_id") if s.suggestion_type == "review_reply" else None,
-                "extra_data": extra_data if s.suggestion_type == "review_reply" else {},
-                "reviewed_by": s.reviewed_by,
-                "published_at": s.published_at.isoformat() if s.published_at else None,
-                "created_at": s.created_at.isoformat() if s.created_at else None,
-                "last_transition_at": s.last_transition_at.isoformat() if s.last_transition_at else None,
-                "status_log": status_log,
-            }
-        )
+    payload = [_serialize_suggestion(s) for s in suggestions]
 
-    return payload
+    if not paginated:
+        return payload
+
+    has_more = offset + len(payload) < total
+    return {
+        "items": payload,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "has_more": has_more,
+        "next_offset": offset + limit if has_more else None,
+    }
+
+
+def _serialize_suggestion(s: Suggestion) -> dict:
+    status_log = hydrate_status_log(s)
+    response_status = build_publish_response_status(s)
+    extra_data = {}
+    try:
+        extra_data = json.loads(getattr(s, "extra_data", "{}") or "{}")
+    except Exception:
+        extra_data = {}
+    return {
+        "id": s.id,
+        "pipeline_run_id": s.pipeline_run_id,
+        "suggestion_type": s.suggestion_type,
+        "field_name": s.field_name,
+        "old_value": s.old_value,
+        "new_value": s.new_value,
+        "reasoning": s.reasoning,
+        "risk_score": s.risk_score,
+        "status": s.status,
+        "review_status": response_status["review_status"],
+        "publish_status": response_status["publish_status"],
+        "publish_message": s.publish_message,
+        "publish_started_at": s.publish_started_at.isoformat() if s.publish_started_at else None,
+        "publish_completed_at": s.publish_completed_at.isoformat() if s.publish_completed_at else None,
+        "published_live": response_status["published_live"],
+        "is_dry_run_result": response_status["is_dry_run_result"],
+        "merged_into_job_id": s.merged_into_job_id,
+        "dispatch_window": s.dispatch_window,
+        "next_eligible_at": s.next_eligible_at.isoformat() if s.next_eligible_at else None,
+        "publish_block_reason": s.publish_block_reason,
+        "publish_error_code": _extract_publish_error_code(s.publish_message, s.publish_block_reason),
+        "review_id": extra_data.get("review_id") if s.suggestion_type == "review_reply" else None,
+        "extra_data": extra_data if s.suggestion_type == "review_reply" else {},
+        "reviewed_by": s.reviewed_by,
+        "published_at": s.published_at.isoformat() if s.published_at else None,
+        "created_at": s.created_at.isoformat() if s.created_at else None,
+        "last_transition_at": s.last_transition_at.isoformat() if s.last_transition_at else None,
+        "status_log": status_log,
+    }
 
 
 def _extract_publish_error_code(*values: str | None) -> str | None:
@@ -124,6 +146,20 @@ def _extract_publish_error_code(*values: str | None) -> str | None:
     return None
 
 
+def _is_terminal_for_cleanup(suggestion: Suggestion) -> bool:
+    response_status = build_publish_response_status(suggestion)
+    review_status = response_status.get("review_status")
+    publish_status = response_status.get("publish_status")
+
+    if review_status == "pending":
+        return False
+
+    if review_status == "approved":
+        return publish_status in {"published", "dry_run_only", "blocked", "failed", "superseded", "rolled_back"}
+
+    return review_status in {"rejected", "superseded", "published"}
+
+
 @router.post("/{app_id}/suggestions/{suggestion_id}/approve")
 async def approve_suggestion(
     app_id: int,
@@ -133,7 +169,7 @@ async def approve_suggestion(
 ):
     """Approve a suggestion and schedule it for publishing."""
     await ensure_app_access(db, user, app_id)
-    suggestion = await _get_suggestion(app_id, suggestion_id, db)
+    suggestion = await _get_suggestion(app_id, suggestion_id, db, for_update=True)
 
     if suggestion.status not in ("pending",):
         raise HTTPException(
@@ -402,10 +438,121 @@ async def retry_suggestion_publish(
     }
 
 
+@router.get("/{app_id}/pipeline-runs")
+async def list_pipeline_runs(
+    app_id: int,
+    limit: int = Query(50, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """List pipeline runs for an app with suggestion summary counts."""
+    await ensure_app_access(db, user, app_id)
+
+    runs_result = await db.execute(
+        select(PipelineRun)
+        .where(PipelineRun.app_id == app_id)
+        .order_by(PipelineRun.id.desc())
+        .limit(limit)
+    )
+    runs = runs_result.scalars().all()
+    run_ids = [r.id for r in runs]
+
+    suggestions_result = await db.execute(
+        select(Suggestion)
+        .where(Suggestion.app_id == app_id)
+        .where(Suggestion.pipeline_run_id.in_(run_ids))
+    )
+    suggestions = suggestions_result.scalars().all()
+    by_run: dict[int, list[Suggestion]] = {}
+    for suggestion in suggestions:
+        if suggestion.pipeline_run_id is None:
+            continue
+        by_run.setdefault(suggestion.pipeline_run_id, []).append(suggestion)
+
+    result = []
+    for run in runs:
+        run_suggestions = by_run.get(run.id, [])
+        total = len(run_suggestions)
+        pending = sum(1 for s in run_suggestions if build_publish_response_status(s).get("review_status") == "pending")
+        all_terminal = total > 0 and all(_is_terminal_for_cleanup(s) for s in run_suggestions)
+        result.append({
+            "id": run.id,
+            "status": run.status,
+            "trigger": run.trigger,
+            "started_at": run.started_at.isoformat() if run.started_at else None,
+            "completed_at": run.completed_at.isoformat() if run.completed_at else None,
+            "suggestions_generated": run.suggestions_generated,
+            "total_suggestions": total,
+            "pending_suggestions": pending,
+            "can_delete": all_terminal,
+        })
+    return {"items": result}
+
+
+@router.delete("/{app_id}/pipeline-runs/{run_id}/suggestions")
+async def delete_pipeline_run_suggestions(
+    app_id: int,
+    run_id: int,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_role("admin")),
+):
+    """Delete all suggestions for a completed pipeline run batch (admin only).
+    Only allowed when all suggestions in the batch are in terminal states."""
+    await ensure_app_access(db, user, app_id)
+
+    suggestions_result = await db.execute(
+        select(Suggestion)
+        .where(Suggestion.app_id == app_id)
+        .where(Suggestion.pipeline_run_id == run_id)
+    )
+    suggestions = suggestions_result.scalars().all()
+
+    if not suggestions:
+        raise HTTPException(status_code=404, detail="No suggestions found for this pipeline run")
+
+    non_terminal = [s for s in suggestions if not _is_terminal_for_cleanup(s)]
+    if non_terminal:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot delete: {len(non_terminal)} suggestion(s) are still in a non-terminal state.",
+        )
+
+    for s in suggestions:
+        await db.delete(s)
+    await db.commit()
+
+    return {"deleted": len(suggestions), "pipeline_run_id": run_id}
+
+
+@router.post("/{app_id}/suggestions/{suggestion_id}/force-reset")
+async def force_reset_suggestion(
+    app_id: int,
+    suggestion_id: int,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_role("admin")),
+):
+    """Force-reset a stuck suggestion back to pending state (admin only)."""
+    await ensure_app_access(db, user, app_id)
+    suggestion = await _get_suggestion(app_id, suggestion_id, db)
+
+    suggestion.status = "pending"
+    suggestion.publish_status = None
+    suggestion.publish_message = f"Force-reset to pending by {user.username}."
+    suggestion.publish_block_reason = None
+    suggestion.publish_started_at = None
+    suggestion.publish_completed_at = None
+    suggestion.reviewed_by = None
+    suggestion.last_transition_at = utcnow_naive()
+    from app.services.suggestion_tracking import build_status_log, apply_status_log
+    apply_status_log(suggestion, build_status_log())
+    await db.commit()
+
+    return {"status": "reset", "suggestion_id": suggestion.id, "message": "Suggestion reset to pending."}
+
+
 @router.post("/{app_id}/pipeline/trigger")
 async def trigger_pipeline(
     app_id: int,
-    body: PipelineTriggerRequest,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(require_any_role("admin", "sub_admin")),
 ):
@@ -475,19 +622,22 @@ async def trigger_pipeline(
         "app_id": app_id,
         "pipeline_run_id": pipeline_run.id,
         "dry_run": dry_run_enabled,
-        "requested_dry_run": body.dry_run,
         "message": "Pipeline queued. Smart duplicate checks will run before any new suggestions are stored.",
         "execution_mode": "demo" if dry_run_enabled else "live",
         "workflow_mode": "manual_approval" if manual_approval_required else "auto_rules",
     }
 
 
-async def _get_suggestion(app_id: int, suggestion_id: int, db: AsyncSession) -> Suggestion:
-    result = await db.execute(
+async def _get_suggestion(app_id: int, suggestion_id: int, db: AsyncSession, for_update: bool = False) -> Suggestion:
+    query = (
         select(Suggestion)
         .where(Suggestion.id == suggestion_id)
         .where(Suggestion.app_id == app_id)
     )
+    if for_update:
+        query = query.with_for_update()
+
+    result = await db.execute(query)
     s = result.scalar_one_or_none()
     if not s:
         raise HTTPException(status_code=404, detail="Suggestion not found")
@@ -536,7 +686,7 @@ def _normalize_utc(value: Optional[datetime]) -> datetime:
 
 
 async def _expire_stale_queued_runs(app_id: int, db: AsyncSession) -> None:
-    cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=2)
+    cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=5)
     result = await db.execute(
         select(PipelineRun)
         .where(PipelineRun.app_id == app_id)

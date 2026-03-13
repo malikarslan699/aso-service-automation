@@ -153,12 +153,12 @@ async def _set_last_check(db: AsyncSession, provider: str, app_id: Optional[int]
         )
 
 
-async def _check_anthropic(config_values: dict[str, str]) -> dict:
-    return await check_anthropic_inference(config_values.get("anthropic_api_key", ""))
+async def _check_anthropic(api_key: str) -> dict:
+    return await check_anthropic_inference(api_key)
 
 
-async def _check_openai(config_values: dict[str, str]) -> dict:
-    return await check_openai_inference(config_values.get("openai_api_key", ""))
+async def _check_openai(api_key: str) -> dict:
+    return await check_openai_inference(api_key)
 
 
 async def _check_telegram(config_values: dict[str, str]) -> tuple[bool, str]:
@@ -322,28 +322,30 @@ async def get_integrations_status(
     google_endpoint = resolve_google_discovery_url(config_values.get("google_api_discovery_url", "")) or "default"
 
     has_app_credential = False
+    has_app_anthropic_key = False
+    has_app_openai_key = False
     if app_id is not None:
         cred_result = await db.execute(
-            select(AppCredential).where(
-                AppCredential.app_id == app_id,
-                AppCredential.credential_type == "service_account_json",
-            )
+            select(AppCredential.credential_type).where(AppCredential.app_id == app_id)
         )
-        has_app_credential = cred_result.scalar_one_or_none() is not None
+        cred_types = set(cred_result.scalars().all())
+        has_app_credential = "service_account_json" in cred_types
+        has_app_anthropic_key = "anthropic_api_key" in cred_types
+        has_app_openai_key = "openai_api_key" in cred_types
 
     integrations = [
         {
             "provider": "anthropic",
             "name": "Anthropic",
             "endpoint": "api.anthropic.com",
-            "configured": bool(config_values.get("anthropic_api_key")),
+            "configured": has_app_anthropic_key or bool(config_values.get("anthropic_api_key")),
             "last_check": last_check("anthropic"),
         },
         {
             "provider": "openai",
             "name": "OpenAI",
             "endpoint": "api.openai.com",
-            "configured": bool(config_values.get("openai_api_key")),
+            "configured": has_app_openai_key or bool(config_values.get("openai_api_key")),
             "last_check": last_check("openai"),
         },
         {
@@ -384,6 +386,21 @@ async def check_integrations(
         await ensure_app_access(db, user, body.app_id)
     config_map = await _load_configs(db)
     config_values = _plain_config_values(config_map)
+    app_overrides: dict[str, str] = {}
+    if body.app_id is not None:
+        app_cred_rows = (
+            await db.execute(
+                select(AppCredential).where(
+                    AppCredential.app_id == body.app_id,
+                    AppCredential.credential_type.in_(("anthropic_api_key", "openai_api_key")),
+                )
+            )
+        ).scalars().all()
+        for row in app_cred_rows:
+            try:
+                app_overrides[row.credential_type] = decrypt_value(row.value)
+            except Exception:
+                continue
 
     requested = body.provider.lower().strip()
     providers = ["anthropic", "openai", "telegram", "serpapi", "google_play"] if requested == "all" else [requested]
@@ -391,11 +408,13 @@ async def check_integrations(
     results: list[dict] = []
     for provider in providers:
         if provider == "anthropic":
-            result = await _check_anthropic(config_values)
+            anthropic_key = app_overrides.get("anthropic_api_key") or config_values.get("anthropic_api_key", "")
+            result = await _check_anthropic(anthropic_key)
             connected = result["connected"]
             message = result["message"]
         elif provider == "openai":
-            result = await _check_openai(config_values)
+            openai_key = app_overrides.get("openai_api_key") or config_values.get("openai_api_key", "")
+            result = await _check_openai(openai_key)
             connected = result["connected"]
             message = result["message"]
         elif provider == "telegram":

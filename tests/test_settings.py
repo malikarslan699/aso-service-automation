@@ -1,4 +1,7 @@
+import pytest
 from httpx import AsyncClient
+
+from app.config import DEFAULT_SECRET_KEY, Settings
 
 
 async def test_settings_global_defaults_present(client: AsyncClient, auth_headers):
@@ -38,3 +41,13 @@ async def test_integrations_check_endpoint_runs(client: AsyncClient, auth_header
     )
     assert resp.status_code == 200
     assert len(resp.json()["results"]) >= 5
+
+
+def test_settings_reject_default_secret_in_live_mode():
+    with pytest.raises(ValueError, match="SECRET_KEY must be changed"):
+        Settings(secret_key=DEFAULT_SECRET_KEY, dry_run=False)
+
+
+def test_settings_allow_default_secret_in_dry_run_mode():
+    settings = Settings(secret_key=DEFAULT_SECRET_KEY, dry_run=True)
+    assert settings.secret_key == DEFAULT_SECRET_KEY

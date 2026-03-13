@@ -1,0 +1,303 @@
+================================================================================
+  ASO-Service — Full Audit & Change Log
+  Date: 2026-03-13
+  Auditor: Claude (AI-assisted audit + implementation)
+================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PROJECT OVERVIEW
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Stack:
+  Backend   : Python 3.12 + FastAPI 0.115 + SQLAlchemy 2 + Alembic + Celery
+  Database  : PostgreSQL 16
+  Queue     : Redis 7 + Celery 5.4
+  Frontend  : React 18 + TypeScript + Vite + TanStack Query + Tailwind CSS
+  AI        : Anthropic Claude API (primary) + OpenAI (fallback)
+  Infra     : Docker Compose + Nginx (Alpine) + Let's Encrypt
+
+Domain: aso.zouqly.com
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+BUG FIXES APPLIED
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[FIX-1] Mobile logout button not visible
+  File   : frontend/src/components/Layout.tsx
+  Problem: Logout button existed only inside the desktop sidebar (hidden md:flex).
+           On mobile the hamburger menu had no logout option.
+  Fix    : Added logout button + username/role display inside the mobile
+           hamburger dropdown (mobileMenuOpen section), below the nav links,
+           with a distinct red styling to distinguish it from navigation items.
+
+[FIX-2] Dry Run ("Driving") mode not shown on Dashboard
+  Files  : frontend/src/pages/Dashboard.tsx
+           app/api/v1/dashboard.py
+  Problem: No visual indicator of whether the system was in DRY RUN or LIVE
+           mode. Users could not tell what mode was active without going to Settings.
+           Also, Dashboard.tsx always sent `dry_run: true` in trigger payload
+           but the backend ignored it — confusing UX.
+  Fix    : - dashboard.py now returns `mode: { dry_run, manual_approval_required }`
+             by reading from runtime config (same source of truth as the pipeline).
+           - Dashboard.tsx shows two mode badges next to the page title:
+             * "DRY RUN MODE" (amber) or "LIVE MODE" (green)
+             * "Manual Approval" or "Auto Rules" (blue)
+
+[FIX-3] Approvals history accumulating with no way to delete
+  Files  : app/api/v1/suggestions.py
+           frontend/src/pages/Approvals.tsx
+  Problem: Every pipeline run created a new suggestion batch. Old batches
+           (published/rejected/dry_run) accumulated indefinitely with no
+           way to clean them up. The page became cluttered over time.
+  Fix    : Backend — two new endpoints:
+             GET  /api/v1/apps/{app_id}/pipeline-runs
+               → Lists all pipeline runs with suggestion counts + `can_delete` flag
+             DELETE /api/v1/apps/{app_id}/pipeline-runs/{run_id}/suggestions
+               → Deletes all suggestions for a completed batch (admin only)
+               → Blocked if any suggestion is in a non-terminal state
+           Frontend — Approvals page now has two tabs:
+             "Pending" — only batches with pending suggestions
+             "History" — closed batches with a "Delete" button (admin only,
+               with a confirm step to prevent accidental deletion)
+
+[FIX-4] Stuck suggestion — force-reset to pending
+  File   : app/api/v1/suggestions.py
+           frontend/src/pages/Approvals.tsx
+  Problem: Suggestions that somehow ended up in a non-pending state could not
+           be re-reviewed (approve endpoint blocks non-pending status).
+           Suggestion #16 was reported as stuck.
+  Fix    : Backend — new endpoint:
+             POST /api/v1/apps/{app_id}/suggestions/{id}/force-reset
+               → Resets status to pending, clears publish state (admin only)
+           Frontend — "Force Reset to Pending" button shown on non-pending
+             suggestions in Approvals page (admin only).
+
+[FIX-5] Dashboard N+1 query problem
+  File   : app/api/v1/dashboard.py
+  Problem: For each app, 4 separate SQL queries were issued:
+             1x pipeline run, 1x approved count, 1x pending count, 1x keywords.
+           With 10 apps = 40 queries per dashboard load.
+  Fix    : Replaced with 4 bulk queries using GROUP BY app_id:
+             1x latest pipeline run per app (subquery)
+             1x pending suggestion counts (GROUP BY app_id)
+             1x approved suggestion counts (GROUP BY app_id)
+             1x active keyword counts (GROUP BY app_id)
+           Result: constant number of queries regardless of app count.
+
+[FIX-6] Stale pipeline run expiry too aggressive (2 min → 5 min)
+  File   : app/api/v1/suggestions.py (_expire_stale_queued_runs)
+  Problem: Queued pipeline runs with 0 steps completed were marked as failed
+           after only 2 minutes. If the Celery worker was slow to start (e.g.
+           cold container start), legitimate runs were incorrectly failed.
+  Fix    : Increased cutoff from timedelta(minutes=2) to timedelta(minutes=5).
+
+[FIX-7] CORS set to allow all origins (*)
+  Files  : app/main.py
+           app/config.py
+  Problem: `allow_origins=["*"]` in production allows any website to make
+           authenticated API requests — a security risk.
+  Fix    : Added `ALLOWED_ORIGINS` setting to config.py (default: "*" for
+           backwards compatibility during development). In production, set
+           ALLOWED_ORIGINS=https://aso.zouqly.com in the .env file.
+           main.py now reads and applies the configured origins.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+NEW FEATURES ADDED
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[NEW-1] /health/detailed endpoint
+  File   : app/main.py
+  Purpose: Allows quick system health verification by anyone (client, auditor,
+           devops) without needing to log in.
+  Returns:
+    {
+      "status": "ok" | "degraded",
+      "api": "ok",
+      "database": "ok" | "error: <type>",
+      "redis": "ok" | "error: <type>",
+      "ai_key_set": true | false,
+      "google_play_key_set": true | false
+    }
+  Usage  : curl https://aso.zouqly.com/health/detailed
+
+[NEW-2] Demo seed data for testing
+  File   : scripts/seed.py
+  Purpose: Provides realistic test data so a client or auditor can see all
+           UI states without needing to run a real pipeline.
+  Creates:
+    - Admin user (admin / myadmin1447)
+    - NetSafe VPN app
+    - Demo pipeline run with 3 suggestions:
+        * 1 pending (visible in Approvals → Pending tab)
+        * 1 rejected (visible in Approvals → History tab)
+        * 1 published (visible in Approvals → History tab)
+  Run    : make seed   (or: docker compose exec api python scripts/seed.py)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+INFRASTRUCTURE IMPROVEMENTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[INFRA-1] Nginx: added missing security headers
+  File   : nginx/default.conf
+  Added  :
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+  Updated:
+    Strict-Transport-Security now includes includeSubDomains
+    X-Frame-Options and X-Content-Type-Options now have `always` flag
+
+[INFRA-2] Docker Compose: resource limits + health checks
+  File   : docker-compose.yml
+  Added memory limits:
+    postgres      : 512m
+    redis         : 256m
+    api           : 512m
+    celery-worker : 512m  (with --concurrency=2)
+    celery-beat   : 256m
+    nginx         : 128m
+  Added health checks:
+    api           : curl /health every 15s
+    celery-beat   : celery inspect ping every 30s
+  Changed:
+    nginx now depends on api with condition: service_healthy
+    (prevents nginx starting before API is ready)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+KNOWN RISKS (NOT YET FIXED — FUTURE WORK)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[RISK-1] No rate limiting on /auth/login
+  Risk   : Brute-force password guessing is possible.
+  Fix    : Add `slowapi` library with a rate limit of e.g. 10 req/min per IP.
+  Status : NOT YET IMPLEMENTED (needs package install + deployment test)
+
+[RISK-2] Approve endpoint race condition
+  File   : app/api/v1/suggestions.py (approve_suggestion)
+  Risk   : Two simultaneous approve requests for the same suggestion can both
+           pass the status == "pending" check and double-queue the task.
+  Fix    : Add `with_for_update()` to the SELECT query in _get_suggestion,
+           or use a DB-level unique constraint.
+  Status : NOT YET IMPLEMENTED
+
+[RISK-3] trigger_pipeline ignores request body dry_run field
+  File   : app/api/v1/suggestions.py (PipelineTriggerRequest)
+  Risk   : Minor UX confusion — the `dry_run` field in the request is accepted
+           but not used. The global config is the only controlling flag.
+  Fix    : Remove `dry_run` from PipelineTriggerRequest to avoid confusion,
+           or honor it as a per-run override.
+  Status : NOT YET IMPLEMENTED (low priority, behavior documented)
+
+[RISK-4] Approvals page truncates at 200 suggestions (backend limit)
+  File   : app/api/v1/suggestions.py (list_suggestions, line .limit(200))
+  Risk   : High-activity apps may have more than 200 suggestions. Older
+           suggestions will be silently dropped from the Approvals page.
+  Fix    : Add pagination to the suggestions endpoint and frontend.
+  Status : NOT YET IMPLEMENTED
+
+[RISK-5] Secret key hardcoded default
+  File   : app/config.py
+  Risk   : If SECRET_KEY is not set in .env, the default "change-me-to-a-random-string"
+           is used, making JWT tokens forgeable.
+  Fix    : Add validation that raises an error if SECRET_KEY is the default value
+           when dry_run=false (i.e., in production).
+  Status : NOT YET IMPLEMENTED
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DRY RUN MODE — BEHAVIOR EXPLAINED
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+When dry_run = true (default):
+  - Pipeline runs normally and generates AI suggestions
+  - Suggestions go through the full review/approval workflow
+  - When a suggestion is approved, it goes through the publish pipeline
+  - BUT: the final Google Play API call is SKIPPED
+  - Suggestions end up with publish_status = "dry_run_only"
+  - No actual changes are made to the app store listing
+  - Safe for testing — can run as many times as needed
+  - Dashboard shows "DRY RUN MODE" badge (amber)
+
+When dry_run = false (live mode):
+  - Everything is the same EXCEPT the final Google Play publish actually runs
+  - Safety limits apply: max_publish_per_day and max_publish_per_week
+  - Suggestions end up with publish_status = "published" and published_live = true
+  - Dashboard shows "LIVE MODE" badge (green)
+
+To switch modes: Settings → Global Config → set dry_run to "false"
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+TESTING CHECKLIST (CLIENT / AUDITOR)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Pre-requisites:
+  1. Run: make up
+  2. Run: make migrate
+  3. Run: make seed
+
+Health Checks:
+  [ ] curl https://aso.zouqly.com/health          → { "status": "ok" }
+  [ ] curl https://aso.zouqly.com/health/detailed  → all services "ok"
+
+Authentication:
+  [ ] Open https://aso.zouqly.com/login
+  [ ] Login with admin / myadmin1447
+  [ ] Confirm redirect to Dashboard
+
+Dashboard:
+  [ ] "DRY RUN MODE" badge visible (amber) next to page title
+  [ ] "Manual Approval" badge visible (blue)
+  [ ] Demo pipeline run shows as "completed"
+  [ ] Pending suggestions count = 1
+
+Approvals — Pending Tab:
+  [ ] 1 suggestion visible: "short_description" pending review
+  [ ] Approve button works → suggestion moves to queue
+  [ ] Reject button works → suggestion moves to History
+
+Approvals — History Tab:
+  [ ] Rejected and published suggestions from demo run visible
+  [ ] "Delete" button visible for admin (all-terminal batch)
+  [ ] Delete confirm → Cancel works (no delete)
+  [ ] Delete confirm → Confirm removes batch
+
+Mobile (open on phone or resize browser < 768px):
+  [ ] Mobile header shows ASO Service logo + theme toggle + hamburger
+  [ ] Tap hamburger → menu opens with all nav items
+  [ ] Logout button visible at bottom of mobile menu (red text)
+  [ ] Logout works from mobile menu
+  [ ] Bottom nav shows nav icons (scrollable)
+
+Settings:
+  [ ] Settings page loads with global config list
+  [ ] dry_run = "true" visible
+  [ ] Integration health check runs without error
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PRODUCTION DEPLOYMENT CHECKLIST
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  [ ] .env: SECRET_KEY set to a strong random string (not the default)
+  [ ] .env: ALLOWED_ORIGINS=https://aso.zouqly.com
+  [ ] .env: ANTHROPIC_API_KEY set
+  [ ] .env: GOOGLE_SERVICE_ACCOUNT_JSON set
+  [ ] .env: DRY_RUN=false (when ready for live publishing)
+  [ ] SSL: make ssl (runs certbot for Let's Encrypt)
+  [ ] Deploy: make deploy
+  [ ] Verify: curl https://aso.zouqly.com/health/detailed
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FILES MODIFIED SUMMARY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  frontend/src/components/Layout.tsx          — Mobile logout button
+  frontend/src/pages/Dashboard.tsx            — Dry run mode badges
+  frontend/src/pages/Approvals.tsx            — History tab + Delete + Force Reset
+  app/api/v1/dashboard.py                     — Mode flags + N+1 fix
+  app/api/v1/suggestions.py                   — 3 new endpoints + stale run fix
+  app/main.py                                 — CORS fix + /health/detailed
+  app/config.py                               — ALLOWED_ORIGINS setting
+  nginx/default.conf                          — Security headers
+  docker-compose.yml                          — Resource limits + health checks
+  scripts/seed.py                             — Demo data for testing
+
+================================================================================

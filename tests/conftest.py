@@ -7,6 +7,7 @@ from app.database import get_db
 from app.models.base import Base
 from app.models.user import User
 from app.auth.security import hash_password, create_access_token
+from app.services.login_rate_limiter import reset_rate_limiter_state_for_tests
 
 engine = create_async_engine(
     "sqlite+aiosqlite://",
@@ -27,6 +28,7 @@ app.dependency_overrides[get_db] = override_get_db
 
 @pytest_asyncio.fixture(autouse=True)
 async def setup_db():
+    await reset_rate_limiter_state_for_tests()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     yield

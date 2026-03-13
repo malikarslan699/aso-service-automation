@@ -1,8 +1,8 @@
 import { useQuery } from "@tanstack/react-query"
-import api from "@/lib/api"
 import { useAuth } from "@/hooks/useAuth"
 import { BarChart2 } from "lucide-react"
 import { getPublishBadge } from "@/lib/publishState"
+import { fetchAllSuggestions } from "@/lib/suggestions"
 import {
   LineChart,
   Line,
@@ -19,8 +19,7 @@ export function Metrics() {
 
   const { data: suggestions = [], isLoading } = useQuery({
     queryKey: ["suggestions-metrics", selectedApp?.id],
-    queryFn: () =>
-      api.get(`/api/v1/apps/${selectedApp?.id}/suggestions`).then((r) => r.data),
+    queryFn: () => fetchAllSuggestions(selectedApp!.id),
     enabled: !!selectedApp,
   })
 

@@ -75,6 +75,61 @@ class TestListSuggestions:
         assert data[0]["field_name"] == "title"
         assert data[0]["status"] == "pending"
 
+    async def test_list_suggestions_paginated_envelope(self, client, auth_headers, test_suggestion):
+        resp = await client.get(
+            f"/api/v1/apps/{test_suggestion['app_id']}/suggestions?paginated=true&limit=50&offset=0",
+            headers=auth_headers,
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "items" in data
+        assert data["limit"] == 50
+        assert data["offset"] == 0
+        assert data["total"] >= 1
+        assert isinstance(data["items"], list)
+
+    async def test_list_suggestions_paginated_has_more_and_next_offset(self, client, auth_headers, test_app):
+        from tests.conftest import test_session
+
+        async with test_session() as session:
+            for idx in range(205):
+                session.add(
+                    Suggestion(
+                        app_id=test_app["id"],
+                        suggestion_type="listing",
+                        field_name="title",
+                        old_value=f"Old Title {idx}",
+                        new_value=f"New Title {idx}",
+                        reasoning="Bulk test",
+                        risk_score=0,
+                        status="pending",
+                        safety_result="{}",
+                    )
+                )
+            await session.commit()
+
+        first = await client.get(
+            f"/api/v1/apps/{test_app['id']}/suggestions?paginated=true&limit=100&offset=0",
+            headers=auth_headers,
+        )
+        assert first.status_code == 200
+        first_data = first.json()
+        assert first_data["total"] == 205
+        assert len(first_data["items"]) == 100
+        assert first_data["has_more"] is True
+        assert first_data["next_offset"] == 100
+
+        last = await client.get(
+            f"/api/v1/apps/{test_app['id']}/suggestions?paginated=true&limit=100&offset=200",
+            headers=auth_headers,
+        )
+        assert last.status_code == 200
+        last_data = last.json()
+        assert last_data["total"] == 205
+        assert len(last_data["items"]) == 5
+        assert last_data["has_more"] is False
+        assert last_data["next_offset"] is None
+
     async def test_list_suggestions_filter_by_status(self, client, auth_headers, test_suggestion):
         resp = await client.get(
             f"/api/v1/apps/{test_suggestion['app_id']}/suggestions?status=pending",
@@ -155,6 +210,20 @@ class TestApproveSuggestion:
         data = resp.json()
         assert any(s["status"] == "approved" for s in data)
 
+    async def test_approve_rejects_second_attempt(self, client, auth_headers, test_suggestion):
+        first = await client.post(
+            f"/api/v1/apps/{test_suggestion['app_id']}/suggestions/{test_suggestion['id']}/approve",
+            headers=auth_headers,
+        )
+        assert first.status_code == 200
+
+        second = await client.post(
+            f"/api/v1/apps/{test_suggestion['app_id']}/suggestions/{test_suggestion['id']}/approve",
+            headers=auth_headers,
+        )
+        assert second.status_code == 400
+        assert "Cannot approve suggestion" in second.json()["detail"]
+
     async def test_approve_requires_admin(self, client, test_suggestion):
         resp = await client.post(
             f"/api/v1/apps/{test_suggestion['app_id']}/suggestions/{test_suggestion['id']}/approve"
@@ -224,13 +293,13 @@ class TestTriggerPipeline:
         resp = await client.post(
             f"/api/v1/apps/{test_app['id']}/pipeline/trigger",
             headers=auth_headers,
-            json={"dry_run": True},
         )
         assert resp.status_code == 200
         data = resp.json()
         assert data["status"] == "queued"
         assert data["workflow_mode"] == "manual_approval"
         assert data["pipeline_run_id"] is not None
+        assert "requested_dry_run" not in data
 
         async with test_session() as session:
             run = await session.get(PipelineRun, data["pipeline_run_id"])
@@ -266,7 +335,6 @@ class TestTriggerPipeline:
         resp = await client.post(
             f"/api/v1/apps/{app_id}/pipeline/trigger",
             headers=sub_headers,
-            json={"dry_run": True},
         )
         assert resp.status_code == 200
         assert resp.json()["status"] == "queued"
@@ -303,7 +371,6 @@ class TestTriggerPipeline:
         resp = await client.post(
             f"/api/v1/apps/{second_app.json()['id']}/pipeline/trigger",
             headers=sub_headers,
-            json={"dry_run": True},
         )
         assert resp.status_code == 403
 
@@ -329,7 +396,6 @@ class TestTriggerPipeline:
         resp = await client.post(
             f"/api/v1/apps/{test_app['id']}/pipeline/trigger",
             headers=auth_headers,
-            json={"dry_run": True},
         )
         assert resp.status_code == 200
         data = resp.json()
@@ -358,7 +424,6 @@ class TestTriggerPipeline:
         resp = await client.post(
             f"/api/v1/apps/{test_app['id']}/pipeline/trigger",
             headers=auth_headers,
-            json={"dry_run": True},
         )
         assert resp.status_code == 200
         data = resp.json()
@@ -379,7 +444,6 @@ class TestTriggerPipeline:
         resp = await client.post(
             f"/api/v1/apps/{test_app['id']}/pipeline/trigger",
             headers=auth_headers,
-            json={"dry_run": True},
         )
         assert resp.status_code == 200
         data = resp.json()
@@ -408,7 +472,6 @@ class TestTriggerPipeline:
         resp = await client.post(
             f"/api/v1/apps/{test_app['id']}/pipeline/trigger",
             headers=auth_headers,
-            json={"dry_run": True},
         )
         assert resp.status_code == 200
         data = resp.json()
@@ -420,6 +483,91 @@ class TestTriggerPipeline:
             assert old_run.status == "failed"
             assert "Queue timeout" in (old_run.error_message or "")
             assert new_run.status == "queued"
+
+
+class TestPipelineRunCleanup:
+    async def test_pipeline_run_can_delete_when_publish_failed(self, client, auth_headers, test_app):
+        from tests.conftest import test_session
+
+        async with test_session() as session:
+            run = PipelineRun(
+                app_id=test_app["id"],
+                status="completed_with_warnings",
+                trigger="manual",
+                steps_completed=9,
+                total_steps=9,
+                started_at=datetime.now(timezone.utc).replace(tzinfo=None),
+                completed_at=datetime.now(timezone.utc).replace(tzinfo=None),
+            )
+            session.add(run)
+            await session.flush()
+            session.add(
+                Suggestion(
+                    app_id=test_app["id"],
+                    pipeline_run_id=run.id,
+                    suggestion_type="listing",
+                    field_name="title",
+                    old_value="Old",
+                    new_value="New",
+                    reasoning="Failed publish case",
+                    risk_score=1,
+                    status="approved",
+                    publish_status="failed",
+                    publish_message="Google publish failed",
+                    safety_result="{}",
+                )
+            )
+            await session.commit()
+            run_id = run.id
+
+        resp = await client.get(
+            f"/api/v1/apps/{test_app['id']}/pipeline-runs",
+            headers=auth_headers,
+        )
+        assert resp.status_code == 200
+        item = next(row for row in resp.json()["items"] if row["id"] == run_id)
+        assert item["can_delete"] is True
+
+    async def test_delete_pipeline_run_suggestions_allows_failed_publish_batch(self, client, auth_headers, test_app):
+        from tests.conftest import test_session
+
+        async with test_session() as session:
+            run = PipelineRun(
+                app_id=test_app["id"],
+                status="completed_with_warnings",
+                trigger="manual",
+                steps_completed=9,
+                total_steps=9,
+                started_at=datetime.now(timezone.utc).replace(tzinfo=None),
+                completed_at=datetime.now(timezone.utc).replace(tzinfo=None),
+            )
+            session.add(run)
+            await session.flush()
+            session.add(
+                Suggestion(
+                    app_id=test_app["id"],
+                    pipeline_run_id=run.id,
+                    suggestion_type="listing",
+                    field_name="short_description",
+                    old_value="Old",
+                    new_value="New",
+                    reasoning="Failed publish case",
+                    risk_score=1,
+                    status="approved",
+                    publish_status="failed",
+                    publish_message="Google publish failed",
+                    safety_result="{}",
+                )
+            )
+            await session.commit()
+            run_id = run.id
+
+        resp = await client.delete(
+            f"/api/v1/apps/{test_app['id']}/pipeline-runs/{run_id}/suggestions",
+            headers=auth_headers,
+        )
+        assert resp.status_code == 200
+        assert resp.json()["deleted"] == 1
 
 
 class TestManualRunDedupe:
@@ -434,11 +582,12 @@ class TestManualRunDedupe:
             {"field_name": "short_description", "new_value": "Queued already", "status": "pending"},
         ]
 
-        deduped, skipped = _dedupe_suggestions(validated, existing)
+        deduped, skipped, reasons = _dedupe_suggestions(validated, existing)
 
         assert skipped == 2
         assert len(deduped) == 1
         assert deduped[0]["field_name"] == "short_description"
+        assert isinstance(reasons, dict)
 
     def test_dedupe_skips_no_op_values(self):
         validated = [
@@ -446,11 +595,12 @@ class TestManualRunDedupe:
             {"field_name": "title", "old_value": "Old", "new_value": "New Title"},
         ]
 
-        deduped, skipped = _dedupe_suggestions(validated, [])
+        deduped, skipped, reasons = _dedupe_suggestions(validated, [])
 
         assert skipped == 1
         assert len(deduped) == 1
         assert deduped[0]["new_value"] == "New Title"
+        assert isinstance(reasons, dict)
 
     def test_dedupe_ignores_pending_from_older_run(self):
         validated = [
@@ -470,7 +620,8 @@ class TestManualRunDedupe:
             }
         ]
 
-        deduped, skipped = _dedupe_suggestions(validated, existing, current_pipeline_run_id=99)
+        deduped, skipped, reasons = _dedupe_suggestions(validated, existing, current_pipeline_run_id=99)
 
         assert skipped == 0
         assert len(deduped) == 1
+        assert isinstance(reasons, dict)

@@ -2,8 +2,9 @@ import { useMemo, useState } from "react"
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query"
 import api from "@/lib/api"
 import { useAuth } from "@/hooks/useAuth"
-import { CheckCircle, XCircle, ChevronDown, ChevronUp, CircleDot, Clock3, ShieldAlert, Sparkles } from "lucide-react"
+import { CheckCircle, XCircle, ChevronDown, ChevronUp, CircleDot, Clock3, ShieldAlert, Sparkles, Trash2, RotateCcw, History } from "lucide-react"
 import { getPublishBadge, getPublishCounterKey, getReviewBadge } from "@/lib/publishState"
+import { fetchAllSuggestions } from "@/lib/suggestions"
 
 const RISK_CONFIG = {
   0: { label: "Safe", color: "text-green-600 bg-green-50 border-green-200" },
@@ -61,12 +62,20 @@ export function Approvals() {
   const [rejectReason, setRejectReason] = useState<Record<number, string>>({})
   const [openBatches, setOpenBatches] = useState<Record<string, boolean>>({})
   const [expandedTimeline, setExpandedTimeline] = useState<Record<number, boolean>>({})
+  const [activeTab, setActiveTab] = useState<"active" | "history">("active")
+  const [deleteConfirm, setDeleteConfirm] = useState<number | null>(null)
 
   const { data: suggestions = [], isLoading } = useQuery({
     queryKey: ["suggestions", selectedApp?.id, "all"],
-    queryFn: () =>
-      api.get(`/api/v1/apps/${selectedApp?.id}/suggestions`).then((r) => r.data),
+    queryFn: () => fetchAllSuggestions(selectedApp!.id),
     enabled: !!selectedApp,
+  })
+
+  const { data: pipelineRunsData, isLoading: runsLoading } = useQuery({
+    queryKey: ["pipeline-runs", selectedApp?.id],
+    queryFn: () =>
+      api.get(`/api/v1/apps/${selectedApp?.id}/pipeline-runs`).then((r) => r.data),
+    enabled: !!selectedApp && activeTab === "history",
   })
 
   const approve = useMutation({
@@ -85,6 +94,22 @@ export function Approvals() {
     mutationFn: (id: number) =>
       api.post(`/api/v1/apps/${selectedApp?.id}/suggestions/${id}/retry-publish`, { reason: "Manual retry from Approvals" }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["suggestions"] }),
+  })
+
+  const forceReset = useMutation({
+    mutationFn: (id: number) =>
+      api.post(`/api/v1/apps/${selectedApp?.id}/suggestions/${id}/force-reset`),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["suggestions"] }),
+  })
+
+  const deleteBatch = useMutation({
+    mutationFn: (runId: number) =>
+      api.delete(`/api/v1/apps/${selectedApp?.id}/pipeline-runs/${runId}/suggestions`),
+    onSuccess: () => {
+      setDeleteConfirm(null)
+      qc.invalidateQueries({ queryKey: ["suggestions"] })
+      qc.invalidateQueries({ queryKey: ["pipeline-runs"] })
+    },
   })
 
   const batches = useMemo(() => {
@@ -108,12 +133,15 @@ export function Approvals() {
         sorted.forEach((item) => {
           counters[getPublishCounterKey(item) as keyof typeof counters] += 1
         })
+        const hasPending = counters.pending > 0
         return {
           key,
           label: key === "legacy" ? "Legacy Suggestions" : `Run #${key}`,
           createdAt: sorted[0]?.created_at || null,
           suggestions: sorted,
           counters,
+          hasPending,
+          runId: key !== "legacy" ? Number(key) : null,
         }
       })
       .sort((a, b) => {
@@ -123,7 +151,17 @@ export function Approvals() {
       })
   }, [suggestions])
 
+  const activeBatches = batches.filter((b) => b.hasPending)
+  const historyBatches = batches.filter((b) => !b.hasPending)
   const totalPending = suggestions.filter((s: any) => s.review_status === "pending").length
+  const runCanDelete = useMemo(() => {
+    const items = (pipelineRunsData as any)?.items || []
+    const map: Record<number, boolean> = {}
+    items.forEach((run: any) => {
+      map[run.id] = Boolean(run.can_delete)
+    })
+    return map
+  }, [pipelineRunsData])
 
   if (!selectedApp) return <div className="text-muted-foreground">Select an app first</div>
   if (isLoading) return <div className="text-muted-foreground">Loading...</div>
@@ -134,6 +172,7 @@ export function Approvals() {
     const timeline = s.status_log || []
     const canReview = s.review_status === "pending" && (user?.role === "admin" || user?.role === "sub_admin")
     const canRetry = user?.role === "admin" && ["blocked", "failed", "superseded", "dry_run_only"].includes(s.publish_status || "")
+    const canForceReset = user?.role === "admin" && s.review_status !== "pending"
 
     return (
       <div key={s.id} className="rounded-lg border border-border bg-card p-4 space-y-3">
@@ -283,6 +322,124 @@ export function Approvals() {
             </button>
           </div>
         )}
+
+        {canForceReset && (
+          <div className="pt-1">
+            <button
+              onClick={() => forceReset.mutate(s.id)}
+              disabled={forceReset.isPending}
+              className="inline-flex items-center gap-1.5 rounded-md border border-amber-300 px-3 py-1.5 text-xs font-medium text-amber-700 hover:bg-amber-50 disabled:opacity-50"
+              title="Force-reset this suggestion back to pending (admin only)"
+            >
+              <RotateCcw className="h-3.5 w-3.5" />
+              Force Reset to Pending
+            </button>
+          </div>
+        )}
+      </div>
+    )
+  }
+
+  const renderBatch = (
+    batch: ReturnType<typeof batches[0]["suggestions"]["map"]> extends never ? never : typeof batches[0],
+    index: number,
+    showDelete = false,
+    canDelete = false,
+  ) => {
+    const isOpen = openBatches[batch.key] ?? index === 0
+    const pendingItems = batch.suggestions.filter((item: any) => item.review_status === "pending")
+    const queuedItems = batch.suggestions.filter((item: any) =>
+      ["approved", "rolled_back"].includes(item.review_status) &&
+      ["ready", "queued", "queued_bundle", "publishing", "waiting_safe_window"].includes(item.publish_status || "ready")
+    )
+    const outcomeItems = batch.suggestions.filter((item: any) =>
+      ["published", "dry_run_only", "blocked", "failed"].includes(item.publish_status)
+    )
+    const rejectedItems = batch.suggestions.filter((item: any) => item.review_status === "rejected")
+    const supersededItems = batch.suggestions.filter((item: any) => item.review_status === "superseded")
+
+    return (
+      <div key={batch.key} className="rounded-xl border border-border bg-card">
+        <div className="flex w-full flex-col gap-3 px-4 py-4 sm:flex-row sm:items-center sm:justify-between">
+          <button
+            type="button"
+            onClick={() => setOpenBatches((prev) => ({ ...prev, [batch.key]: !isOpen }))}
+            className="flex flex-1 flex-col gap-2 text-left sm:flex-row sm:items-center sm:gap-3"
+          >
+            <div className="flex items-center gap-2">
+              <Sparkles className="h-4 w-4 text-primary shrink-0" />
+              <span className="text-base font-semibold">{batch.label}</span>
+            </div>
+            <div className="text-xs text-muted-foreground">
+              {batch.createdAt ? new Date(batch.createdAt).toLocaleString() : "No timestamp"}
+            </div>
+          </button>
+          <div className="flex flex-wrap items-center gap-2">
+            {[
+              { label: "Pending", value: batch.counters.pending, tone: "text-slate-700 bg-slate-50 border-slate-200" },
+              { label: "Ready", value: batch.counters.approvedReady, tone: "text-amber-700 bg-amber-50 border-amber-200" },
+              { label: "Queued", value: batch.counters.queued, tone: "text-blue-700 bg-blue-50 border-blue-200" },
+              { label: "Published", value: batch.counters.published, tone: "text-green-700 bg-green-50 border-green-200" },
+              { label: "Dry Run", value: batch.counters.dryRun, tone: "text-amber-700 bg-amber-50 border-amber-200" },
+              { label: "Blocked", value: batch.counters.blocked, tone: "text-red-700 bg-red-50 border-red-200" },
+            ].filter((c) => c.value > 0).map((counter) => (
+              <span key={`${batch.key}-${counter.label}`} className={`inline-flex items-center rounded-full border px-2.5 py-1 text-[11px] font-medium ${counter.tone}`}>
+                {counter.label}: {counter.value}
+              </span>
+            ))}
+            {showDelete && batch.runId && user?.role === "admin" && canDelete && (
+              deleteConfirm === batch.runId ? (
+                <div className="flex items-center gap-1">
+                  <span className="text-xs text-red-600">Delete all?</span>
+                  <button
+                    onClick={() => deleteBatch.mutate(batch.runId!)}
+                    disabled={deleteBatch.isPending}
+                    className="rounded px-2 py-1 text-xs font-medium bg-red-600 text-white hover:bg-red-700 disabled:opacity-50"
+                  >Confirm</button>
+                  <button
+                    onClick={() => setDeleteConfirm(null)}
+                    className="rounded px-2 py-1 text-xs font-medium border border-border hover:bg-accent"
+                  >Cancel</button>
+                </div>
+              ) : (
+                <button
+                  onClick={() => setDeleteConfirm(batch.runId)}
+                  className="inline-flex items-center gap-1 rounded-full border border-red-200 px-2.5 py-1 text-[11px] font-medium text-red-600 hover:bg-red-50"
+                  title="Delete this batch from history"
+                >
+                  <Trash2 className="h-3 w-3" />
+                  Delete
+                </button>
+              )
+            )}
+            {showDelete && batch.runId && user?.role === "admin" && !canDelete && (
+              <span className="inline-flex items-center rounded-full border border-amber-200 px-2.5 py-1 text-[11px] font-medium text-amber-700 bg-amber-50">
+                Not deletable yet
+              </span>
+            )}
+          </div>
+        </div>
+
+        {isOpen && (
+          <div className="space-y-5 border-t border-border px-4 py-4">
+            {[
+              { title: "Pending Review", items: pendingItems },
+              { title: "Approved / Publish Queue", items: queuedItems },
+              { title: "Publish Results", items: outcomeItems },
+              { title: "Superseded", items: supersededItems },
+              { title: "Rejected", items: rejectedItems },
+            ]
+              .filter((section) => section.items.length > 0)
+              .map((section) => (
+                <div key={`${batch.key}-${section.title}`} className="space-y-3">
+                  <div className="text-sm font-medium">{section.title}</div>
+                  <div className="space-y-3">
+                    {section.items.map((item: any) => renderSuggestionCard(item))}
+                  </div>
+                </div>
+              ))}
+          </div>
+        )}
       </div>
     )
   }
@@ -293,85 +450,77 @@ export function Approvals() {
         <h1 className="text-2xl font-bold">Approvals</h1>
         <p className="text-muted-foreground text-sm mt-1">
           {totalPending} suggestion{totalPending !== 1 ? "s" : ""} pending review
+          {batches.length > 0 && ` · ${batches.length} batch${batches.length !== 1 ? "es" : ""} total`}
         </p>
       </div>
 
-      {suggestions.length === 0 ? (
-        <div className="flex flex-col items-center py-16 text-muted-foreground">
-          <CheckCircle className="h-12 w-12 mb-3 opacity-20" />
-          <p>All caught up! No pending suggestions.</p>
-        </div>
-      ) : (
-        <div className="space-y-4">
-          {batches.map((batch, index) => {
-            const isOpen = openBatches[batch.key] ?? index === 0
-            const pendingItems = batch.suggestions.filter((item: any) => item.review_status === "pending")
-            const queuedItems = batch.suggestions.filter((item: any) =>
-              ["approved", "rolled_back"].includes(item.review_status) &&
-              ["ready", "queued", "queued_bundle", "publishing", "waiting_safe_window"].includes(item.publish_status || "ready")
-            )
-            const outcomeItems = batch.suggestions.filter((item: any) =>
-              ["published", "dry_run_only", "blocked", "failed"].includes(item.publish_status)
-            )
-            const rejectedItems = batch.suggestions.filter((item: any) => item.review_status === "rejected")
-            const supersededItems = batch.suggestions.filter((item: any) => item.review_status === "superseded")
+      {/* Tabs */}
+      <div className="flex gap-1 rounded-xl border border-border bg-muted/40 p-1 w-fit">
+        <button
+          onClick={() => setActiveTab("active")}
+          className={`flex items-center gap-2 rounded-lg px-4 py-2 text-sm font-medium transition-colors ${
+            activeTab === "active" ? "bg-background shadow-sm text-foreground" : "text-muted-foreground hover:text-foreground"
+          }`}
+        >
+          Pending
+          {totalPending > 0 && (
+            <span className="rounded-full bg-primary px-1.5 py-0.5 text-[10px] font-semibold text-primary-foreground">
+              {totalPending}
+            </span>
+          )}
+        </button>
+        <button
+          onClick={() => setActiveTab("history")}
+          className={`flex items-center gap-2 rounded-lg px-4 py-2 text-sm font-medium transition-colors ${
+            activeTab === "history" ? "bg-background shadow-sm text-foreground" : "text-muted-foreground hover:text-foreground"
+          }`}
+        >
+          <History className="h-3.5 w-3.5" />
+          History
+          {historyBatches.length > 0 && (
+            <span className="rounded-full bg-muted border border-border px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
+              {historyBatches.length}
+            </span>
+          )}
+        </button>
+      </div>
 
-            return (
-              <div key={batch.key} className="rounded-xl border border-border bg-card">
-                <button
-                  type="button"
-                  onClick={() => setOpenBatches((prev) => ({ ...prev, [batch.key]: !isOpen }))}
-                  className="flex w-full flex-col gap-3 px-4 py-4 text-left sm:flex-row sm:items-center sm:justify-between"
-                >
-                  <div>
-                    <div className="flex items-center gap-2">
-                      <Sparkles className="h-4 w-4 text-primary" />
-                      <span className="text-base font-semibold">{batch.label}</span>
-                    </div>
-                    <div className="mt-1 text-xs text-muted-foreground">
-                      {batch.createdAt ? new Date(batch.createdAt).toLocaleString() : "No timestamp"}
-                    </div>
-                  </div>
-                  <div className="flex flex-wrap gap-2">
-                    {[
-                      { label: "Pending", value: batch.counters.pending, tone: "text-slate-700 bg-slate-50 border-slate-200" },
-                      { label: "Ready", value: batch.counters.approvedReady, tone: "text-amber-700 bg-amber-50 border-amber-200" },
-                      { label: "Queued", value: batch.counters.queued, tone: "text-blue-700 bg-blue-50 border-blue-200" },
-                      { label: "Published", value: batch.counters.published, tone: "text-green-700 bg-green-50 border-green-200" },
-                      { label: "Dry Run", value: batch.counters.dryRun, tone: "text-amber-700 bg-amber-50 border-amber-200" },
-                      { label: "Blocked", value: batch.counters.blocked, tone: "text-red-700 bg-red-50 border-red-200" },
-                    ].map((counter) => (
-                      <span key={`${batch.key}-${counter.label}`} className={`inline-flex items-center rounded-full border px-2.5 py-1 text-[11px] font-medium ${counter.tone}`}>
-                        {counter.label}: {counter.value}
-                      </span>
-                    ))}
-                  </div>
-                </button>
+      {activeTab === "active" && (
+        <>
+          {activeBatches.length === 0 ? (
+            <div className="flex flex-col items-center py-16 text-muted-foreground">
+              <CheckCircle className="h-12 w-12 mb-3 opacity-20" />
+              <p className="font-medium">All caught up!</p>
+              <p className="text-sm mt-1">No pending suggestions. Check the History tab for past batches.</p>
+            </div>
+          ) : (
+            <div className="space-y-4">
+              {activeBatches.map((batch, index) => renderBatch(batch as any, index, false))}
+            </div>
+          )}
+        </>
+      )}
 
-                {isOpen && (
-                  <div className="space-y-5 border-t border-border px-4 py-4">
-                    {[
-                      { title: "Pending Review", items: pendingItems },
-                      { title: "Approved / Publish Queue", items: queuedItems },
-                      { title: "Publish Results", items: outcomeItems },
-                      { title: "Superseded", items: supersededItems },
-                      { title: "Rejected", items: rejectedItems },
-                    ]
-                      .filter((section) => section.items.length > 0)
-                      .map((section) => (
-                        <div key={`${batch.key}-${section.title}`} className="space-y-3">
-                          <div className="text-sm font-medium">{section.title}</div>
-                          <div className="space-y-3">
-                            {section.items.map((item: any) => renderSuggestionCard(item))}
-                          </div>
-                        </div>
-                      ))}
-                  </div>
-                )}
-              </div>
-            )
-          })}
-        </div>
+      {activeTab === "history" && (
+        <>
+          {historyBatches.length === 0 ? (
+            <div className="flex flex-col items-center py-16 text-muted-foreground">
+              <History className="h-12 w-12 mb-3 opacity-20" />
+              <p className="font-medium">No history yet</p>
+              <p className="text-sm mt-1">Completed and closed batches will appear here.</p>
+            </div>
+          ) : (
+            <div className="space-y-4">
+              <p className="text-xs text-muted-foreground">
+                Batches where all suggestions are in a terminal state can be deleted to keep the list clean.
+                {user?.role === "admin" && " Only admin can delete batches."}
+              </p>
+              {historyBatches.map((batch, index) =>
+                renderBatch(batch as any, index, true, batch.runId ? runCanDelete[batch.runId] ?? false : false),
+              )}
+            </div>
+          )}
+        </>
       )}
     </div>
   )

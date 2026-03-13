@@ -13,7 +13,7 @@ def _dedupe_suggestions(
     validated: list[dict],
     existing_suggestions: list[dict],
     current_pipeline_run_id: int | None = None,
-) -> tuple[list[dict], int]:
+) -> tuple[list[dict], int, dict[str, int]]:
     # Pending suggestions from older runs should not block fresh suggestions.
     # They are superseded later once this run creates new items.
     dedupe_context = [
@@ -27,11 +27,14 @@ def _dedupe_suggestions(
     ]
     deduped: list[dict] = []
     duplicates_skipped = 0
+    skip_reasons: dict[str, int] = {}
 
     for suggestion in validated:
-        should_skip, _reason = should_skip_candidate(suggestion, dedupe_context)
+        should_skip, reason = should_skip_candidate(suggestion, dedupe_context)
         if should_skip:
             duplicates_skipped += 1
+            reason_key = (reason or "duplicate").strip().lower()
+            skip_reasons[reason_key] = skip_reasons.get(reason_key, 0) + 1
             continue
 
         deduped.append(suggestion)
@@ -45,7 +48,7 @@ def _dedupe_suggestions(
             }
         )
 
-    return deduped, duplicates_skipped
+    return deduped, duplicates_skipped, skip_reasons
 
 
 def _supersede_old_pending_suggestions(app_id: int, current_pipeline_run_id: int, db) -> int:
@@ -127,6 +130,7 @@ def run_daily_pipeline(self, app_id: int, trigger: str = "scheduled", pipeline_r
         step_log = build_step_log()
         suggestions_generated = 0
         duplicates_skipped = 0
+        duplicate_reason_counts: dict[str, int] = {}
         auto_approved = 0
         high_risk = []
 
@@ -175,20 +179,26 @@ def run_daily_pipeline(self, app_id: int, trigger: str = "scheduled", pipeline_r
             dry_run = is_true(config_values.get("dry_run"), settings.dry_run)
             manual_approval_required = is_true(config_values.get("manual_approval_required"), True)
             auto_approve_threshold = as_int(config_values.get("auto_approve_threshold"), 0)
-            anthropic_api_key = config_values.get("anthropic_api_key") or settings.anthropic_api_key
-            openai_api_key = config_values.get("openai_api_key") or settings.openai_api_key
-
-            cred_row = db.execute(
+            credential_rows = db.execute(
                 select(AppCredential)
                 .where(AppCredential.app_id == app_id)
-                .where(AppCredential.credential_type == "service_account_json")
-            ).scalar_one_or_none()
-            credential_json = None
-            if cred_row:
+                .where(
+                    AppCredential.credential_type.in_(
+                        ("service_account_json", "anthropic_api_key", "openai_api_key")
+                    )
+                )
+            ).scalars().all()
+
+            credential_map: dict[str, str] = {}
+            for row in credential_rows:
                 try:
-                    credential_json = decrypt_value(cred_row.value)
+                    credential_map[row.credential_type] = decrypt_value(row.value)
                 except Exception:
-                    credential_json = None
+                    continue
+
+            credential_json = credential_map.get("service_account_json")
+            anthropic_api_key = credential_map.get("anthropic_api_key") or config_values.get("anthropic_api_key") or settings.anthropic_api_key
+            openai_api_key = credential_map.get("openai_api_key") or config_values.get("openai_api_key") or settings.openai_api_key
 
             facts = db.execute(select(AppFact).where(AppFact.app_id == app_id)).scalars().all()
             app_facts = [{"fact_key": fact.fact_key, "fact_value": fact.fact_value, "verified": fact.verified} for fact in facts]
@@ -307,13 +317,17 @@ def run_daily_pipeline(self, app_id: int, trigger: str = "scheduled", pipeline_r
                 raw["status"] = "pending"
                 validated.append(raw)
 
-            validated, duplicates_skipped = _dedupe_suggestions(validated, recent_suggestions, pipeline_run.id)
+            validated, duplicates_skipped, duplicate_reason_counts = _dedupe_suggestions(validated, recent_suggestions, pipeline_run.id)
             pipeline_run.duplicates_skipped = duplicates_skipped
+            reason_summary = ", ".join(f"{key}: {count}" for key, count in sorted(duplicate_reason_counts.items()))
             step_log = update_step(
                 step_log,
                 "duplicate_filtering",
                 status="completed",
-                message=f"Skipped {duplicates_skipped} duplicate or no-op suggestion(s)",
+                message=(
+                    f"Skipped {duplicates_skipped} duplicate or no-op suggestion(s)"
+                    + (f" ({reason_summary})" if reason_summary else "")
+                ),
             )
             persist_run(db, pipeline_run, step_log)
 
@@ -431,6 +445,7 @@ def run_daily_pipeline(self, app_id: int, trigger: str = "scheduled", pipeline_r
                 "pipeline_run_id": pipeline_run.id,
                 "suggestions_generated": suggestions_generated,
                 "duplicates_skipped": duplicates_skipped,
+                "duplicate_reason_counts": duplicate_reason_counts,
                 "auto_approved": auto_approved,
                 "high_risk_count": len(high_risk),
                 "superseded_count": superseded_count if suggestions_generated else 0,

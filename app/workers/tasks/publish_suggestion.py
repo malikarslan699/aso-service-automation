@@ -107,7 +107,7 @@ def publish_suggestion_task(suggestion_id: int, app_id: int):
                 occurred_at=blocked_at,
             )
             apply_status_log(suggestion, status_log)
-            db.add(SystemLog(level="warning", module="publish_suggestion", message=reason))
+            db.add(SystemLog(level="warning", module="publish_suggestion", message=reason, app_id=app_id))
             db.commit()
             return {"status": "blocked", "reason": reason}
 
@@ -150,7 +150,7 @@ def publish_suggestion_task(suggestion_id: int, app_id: int):
                 occurred_at=blocked_at,
             )
             apply_status_log(suggestion, status_log)
-            db.add(SystemLog(level="warning", module="publish_suggestion", message=reason))
+            db.add(SystemLog(level="warning", module="publish_suggestion", message=reason, app_id=app_id))
             db.commit()
             return {"status": "blocked", "reason": reason}
 
@@ -180,7 +180,7 @@ def publish_suggestion_task(suggestion_id: int, app_id: int):
                 occurred_at=blocked_at,
             )
             apply_status_log(suggestion, status_log)
-            db.add(SystemLog(level="warning", module="publish_suggestion", message=similar_live_reason))
+            db.add(SystemLog(level="warning", module="publish_suggestion", message=similar_live_reason, app_id=app_id))
             db.commit()
             return {"status": "blocked", "reason": similar_live_reason}
 
@@ -255,6 +255,7 @@ def publish_suggestion_task(suggestion_id: int, app_id: int):
                 level="info" if result.get("success") else "warning",
                 module="publish_suggestion",
                 message=f"Suggestion {suggestion_id}: {result.get('message', 'publish attempt finished')}",
+                app_id=app_id,
             )
         )
         db.commit()

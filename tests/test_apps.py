@@ -116,6 +116,40 @@ async def test_upload_service_account_rejects_invalid_json(client: AsyncClient, 
 
 
 @pytest.mark.asyncio
+async def test_project_text_credential_upsert_and_status(client: AsyncClient, auth_headers):
+    create_resp = await client.post(
+        "/api/v1/apps",
+        json={"name": "AI Key App", "package_name": "com.ai.key.app"},
+        headers=auth_headers,
+    )
+    app_id = create_resp.json()["id"]
+
+    save_resp = await client.put(
+        f"/api/v1/apps/{app_id}/credentials/text",
+        json={"credential_type": "anthropic_api_key", "value": "test-anthropic-key"},
+        headers=auth_headers,
+    )
+    assert save_resp.status_code == 200
+    assert save_resp.json()["configured"] is True
+
+    status_resp = await client.get(f"/api/v1/apps/{app_id}/credentials/status", headers=auth_headers)
+    assert status_resp.status_code == 200
+    assert status_resp.json()["anthropic_api_key"] is True
+
+    clear_resp = await client.put(
+        f"/api/v1/apps/{app_id}/credentials/text",
+        json={"credential_type": "anthropic_api_key", "value": ""},
+        headers=auth_headers,
+    )
+    assert clear_resp.status_code == 200
+    assert clear_resp.json()["configured"] is False
+
+    status_after_clear = await client.get(f"/api/v1/apps/{app_id}/credentials/status", headers=auth_headers)
+    assert status_after_clear.status_code == 200
+    assert status_after_clear.json()["anthropic_api_key"] is False
+
+
+@pytest.mark.asyncio
 async def test_sub_admin_can_create_own_app_and_see_it(client: AsyncClient, auth_headers):
     create_sub = await client.post(
         "/api/v1/team/users",
@@ -141,3 +175,48 @@ async def test_sub_admin_can_create_own_app_and_see_it(client: AsyncClient, auth
     assert list_resp.status_code == 200
     apps = list_resp.json()
     assert any(app["package_name"] == "com.owned.app" for app in apps)
+
+
+@pytest.mark.asyncio
+async def test_admin_sees_only_own_projects(client: AsyncClient, auth_headers):
+    from tests.conftest import test_session
+    from app.models.user import User
+    from app.auth.security import hash_password
+
+    first_app = await client.post(
+        "/api/v1/apps",
+        json={"name": "Admin One App", "package_name": "com.admin.one.app"},
+        headers=auth_headers,
+    )
+    assert first_app.status_code == 201
+
+    async with test_session() as session:
+        session.add(
+            User(
+                username="secondadmin",
+                email="second@admin.test",
+                hashed_password=hash_password("pass1234"),
+                role="admin",
+                is_active=True,
+            )
+        )
+        await session.commit()
+
+    second_login = await client.post("/auth/login", json={"username": "secondadmin", "password": "pass1234"})
+    assert second_login.status_code == 200
+    second_headers = {"Authorization": f"Bearer {second_login.json()['access_token']}"}
+
+    second_list_before = await client.get("/api/v1/apps", headers=second_headers)
+    assert second_list_before.status_code == 200
+    assert all(app["package_name"] != "com.admin.one.app" for app in second_list_before.json())
+
+    second_create = await client.post(
+        "/api/v1/apps",
+        json={"name": "Admin Two App", "package_name": "com.admin.two.app"},
+        headers=second_headers,
+    )
+    assert second_create.status_code == 201
+
+    first_list_after = await client.get("/api/v1/apps", headers=auth_headers)
+    assert first_list_after.status_code == 200
+    assert all(app["package_name"] != "com.admin.two.app" for app in first_list_after.json())

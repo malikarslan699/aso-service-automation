@@ -26,6 +26,59 @@ async def test_login_nonexistent_user(client: AsyncClient):
     assert response.status_code == 401
 
 
+async def test_login_rate_limited_after_too_many_failures(client: AsyncClient, admin_user):
+    headers = {"X-Forwarded-For": "203.0.113.10"}
+
+    for _ in range(10):
+        response = await client.post(
+            "/auth/login",
+            json={"username": "testadmin", "password": "wrong"},
+            headers=headers,
+        )
+        assert response.status_code == 401
+
+    blocked = await client.post(
+        "/auth/login",
+        json={"username": "testadmin", "password": "wrong"},
+        headers=headers,
+    )
+    assert blocked.status_code == 429
+
+
+async def test_login_success_resets_failed_attempt_counter(client: AsyncClient, admin_user):
+    headers = {"X-Forwarded-For": "203.0.113.11"}
+
+    for _ in range(5):
+        response = await client.post(
+            "/auth/login",
+            json={"username": "testadmin", "password": "wrong"},
+            headers=headers,
+        )
+        assert response.status_code == 401
+
+    success = await client.post(
+        "/auth/login",
+        json={"username": "testadmin", "password": "testpass"},
+        headers=headers,
+    )
+    assert success.status_code == 200
+
+    for _ in range(10):
+        response = await client.post(
+            "/auth/login",
+            json={"username": "testadmin", "password": "wrong"},
+            headers=headers,
+        )
+        assert response.status_code == 401
+
+    blocked = await client.post(
+        "/auth/login",
+        json={"username": "testadmin", "password": "wrong"},
+        headers=headers,
+    )
+    assert blocked.status_code == 429
+
+
 async def test_me_endpoint(client: AsyncClient, admin_user):
     """Login first, then use the returned token for /me."""
     login_resp = await client.post("/auth/login", json={"username": "testadmin", "password": "testpass"})

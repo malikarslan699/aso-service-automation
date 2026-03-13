@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File,
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, or_
 from typing import List
+from pydantic import BaseModel
 from app.database import get_db
 from app.dependencies import get_current_user, require_any_role, require_role, ensure_app_access
 from app.models.user import User
@@ -18,6 +19,13 @@ from app.services.data_fetcher import verify_google_play_connection, resolve_goo
 
 router = APIRouter()
 
+TEXT_CREDENTIAL_TYPES = {"anthropic_api_key", "openai_api_key"}
+
+
+class TextCredentialRequest(BaseModel):
+    credential_type: str
+    value: str
+
 
 @router.get("", response_model=List[AppOut])
 async def list_apps(
@@ -25,7 +33,7 @@ async def list_apps(
     user: User = Depends(get_current_user),
 ):
     query = select(App).order_by(App.created_at.desc())
-    if user.role == "sub_admin":
+    if user.role in {"admin", "sub_admin"}:
         query = (
             select(App)
             .outerjoin(
@@ -125,6 +133,63 @@ async def upload_credential(
 
     await db.commit()
     return {"status": "ok", "credential_type": credential_type}
+
+
+@router.put("/{app_id}/credentials/text")
+async def upsert_text_credential(
+    app_id: int,
+    body: TextCredentialRequest,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_any_role("admin", "sub_admin")),
+):
+    await ensure_app_access(db, user, app_id)
+    credential_type = body.credential_type.strip().lower()
+    if credential_type not in TEXT_CREDENTIAL_TYPES:
+        raise HTTPException(status_code=400, detail=f"Unsupported credential_type. Allowed: {', '.join(sorted(TEXT_CREDENTIAL_TYPES))}")
+
+    value = body.value.strip()
+    existing = await db.execute(
+        select(AppCredential).where(
+            AppCredential.app_id == app_id,
+            AppCredential.credential_type == credential_type,
+        )
+    )
+    cred = existing.scalar_one_or_none()
+
+    if not value:
+        if cred:
+            await db.delete(cred)
+            await db.commit()
+        return {"status": "ok", "credential_type": credential_type, "configured": False}
+
+    encrypted = encrypt_value(value)
+    if cred:
+        cred.value = encrypted
+    else:
+        db.add(AppCredential(app_id=app_id, credential_type=credential_type, value=encrypted))
+    await db.commit()
+    return {"status": "ok", "credential_type": credential_type, "configured": True}
+
+
+@router.get("/{app_id}/credentials/status")
+async def get_credential_status(
+    app_id: int,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    await ensure_app_access(db, user, app_id)
+    rows = (
+        await db.execute(
+            select(AppCredential.credential_type).where(AppCredential.app_id == app_id)
+        )
+    ).scalars().all()
+    configured = set(rows)
+    return {
+        "app_id": app_id,
+        "service_account_json": "service_account_json" in configured,
+        "anthropic_api_key": "anthropic_api_key" in configured,
+        "openai_api_key": "openai_api_key" in configured,
+    }
 
 
 @router.get("/{app_id}/connections/google-play")

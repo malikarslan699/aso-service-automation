@@ -33,7 +33,7 @@ const navItems = [
   { to: "/facts", label: "App Facts", icon: Shield },
   { to: "/sub-admins", label: "Sub Admins", icon: Users, adminOnly: true },
   { to: "/settings", label: "Settings", icon: Settings },
-  { to: "/logs", label: "Logs", icon: FileText, adminOnly: true },
+  { to: "/logs", label: "Logs", icon: FileText },
 ]
 
 export function Layout() {
@@ -52,7 +52,7 @@ export function Layout() {
       <aside className="hidden md:flex w-72 flex-col border-r border-[hsl(var(--sidebar-border))] bg-[hsl(var(--sidebar))] text-[hsl(var(--sidebar-foreground))]">
         {/* Logo */}
         <div className="border-b border-[hsl(var(--sidebar-border))] px-4 py-5">
-          <div className="flex items-center gap-3">
+          <Link to="/" className="flex items-center gap-3">
             <div className="flex h-11 w-11 items-center justify-center rounded-2xl bg-primary/10 text-primary">
               <Shield className="h-5 w-5" />
             </div>
@@ -60,7 +60,7 @@ export function Layout() {
               <span className="block text-base font-semibold">ASO Service</span>
               <span className="block text-xs text-muted-foreground">Projects, approvals and publishing</span>
             </div>
-          </div>
+          </Link>
         </div>
 
         {/* App Selector */}
@@ -95,7 +95,6 @@ export function Layout() {
             <div className="mb-3 flex items-center justify-between">
               <div className="text-xs text-muted-foreground">
                 <div className="font-medium text-foreground">{user?.username}</div>
-                <div>{user?.role}</div>
               </div>
               <button
                 onClick={toggleTheme}
@@ -137,8 +136,10 @@ export function Layout() {
         <header className="sticky top-0 z-40 md:hidden border-b border-border bg-card/90 px-4 py-3 backdrop-blur">
           <div className="flex items-center justify-between gap-2">
             <div className="flex items-center gap-2">
-              <Shield className="h-5 w-5 text-primary" />
-              <span className="font-semibold text-sm">ASO Service</span>
+              <Link to="/" className="flex items-center gap-2">
+                <Shield className="h-5 w-5 text-primary" />
+                <span className="font-semibold text-sm">ASO Service</span>
+              </Link>
             </div>
             <div className="flex items-center gap-2">
               <button
@@ -182,6 +183,16 @@ export function Layout() {
                   )
                 })}
               </nav>
+              <div className="mt-2 border-t border-border pt-2">
+                <div className="px-3 py-1 text-xs text-muted-foreground">{user?.username}</div>
+                <button
+                  onClick={() => { logout(); setMobileMenuOpen(false) }}
+                  className="flex w-full items-center gap-3 rounded-xl px-3 py-3 text-sm text-red-600 transition-colors hover:bg-red-50"
+                >
+                  <LogOut className="h-4 w-4" />
+                  Logout
+                </button>
+              </div>
             </div>
           )}
         </header>

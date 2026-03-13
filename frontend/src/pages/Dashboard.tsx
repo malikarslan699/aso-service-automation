@@ -10,6 +10,7 @@ import {
   PlayCircle,
   Receipt,
   Sparkles,
+  ExternalLink,
   XCircle,
 } from "lucide-react"
 
@@ -61,7 +62,7 @@ export function Dashboard() {
   })
 
   const runNow = useMutation({
-    mutationFn: () => api.post(`/api/v1/apps/${selectedApp?.id}/pipeline/trigger`, { dry_run: true }).then((response) => response.data),
+    mutationFn: () => api.post(`/api/v1/apps/${selectedApp?.id}/pipeline/trigger`).then((response) => response.data),
     onSuccess: (result) => {
       if (result.status === "queued") {
         const modeText =
@@ -154,11 +155,36 @@ export function Dashboard() {
   const statusColor = statusColors[pipelineStatus] ?? "text-muted-foreground"
   const stepLog: StepLogItem[] = pipeline?.step_log || []
 
+  const mode = data?.mode
+  const isDryRun = mode?.dry_run !== false
+  const isManualApproval = mode?.manual_approval_required !== false
+  const providerName = String(pipeline?.provider_name || "").toLowerCase()
+  const providerStatus = String(pipeline?.provider_status || "").toLowerCase()
+  const providerErrorClass = String(pipeline?.provider_error_class || "").toLowerCase()
+  const showClaudeBilling = providerName.includes("anthropic")
+  const needsBillingAttention = providerStatus.includes("billing") || providerErrorClass.includes("billing")
+
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-bold">Dashboard</h1>
-        <p className="mt-1 text-sm text-muted-foreground">{appData.package_name}</p>
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+        <div>
+          <h1 className="text-2xl font-bold">Dashboard</h1>
+          <p className="mt-1 text-sm text-muted-foreground">{appData.package_name}</p>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <span className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-semibold ${
+            isDryRun
+              ? "border-amber-300 bg-amber-50 text-amber-700"
+              : "border-green-300 bg-green-50 text-green-700"
+          }`}>
+            <span className={`h-1.5 w-1.5 rounded-full ${isDryRun ? "bg-amber-500" : "bg-green-500"}`} />
+            {isDryRun ? "DRY RUN MODE" : "LIVE MODE"}
+          </span>
+          <span className="inline-flex items-center gap-1.5 rounded-full border border-blue-200 bg-blue-50 px-3 py-1 text-xs font-medium text-blue-700">
+            {isManualApproval ? "Manual Approval" : "Auto Rules"}
+          </span>
+          <span className="w-full text-[11px] text-muted-foreground">Mode status labels only (not buttons).</span>
+        </div>
       </div>
 
       {feedback && <div className={`rounded-2xl border px-4 py-3 text-sm ${feedbackClass}`}>{feedback.message}</div>}
@@ -215,6 +241,23 @@ export function Dashboard() {
                 <div className="mt-1 text-xs text-muted-foreground">Fallback: {pipeline.fallback_provider_name}</div>
               )}
               {pipeline?.provider_status && <div className="mt-1 text-xs text-muted-foreground">Health: {formatStatus(pipeline.provider_status)}</div>}
+              {showClaudeBilling && (
+                <div className="mt-2 rounded-xl border border-border bg-background/80 p-2">
+                  <div className="text-[11px] uppercase tracking-[0.16em] text-muted-foreground">Claude Billing</div>
+                  <div className={`mt-1 text-xs ${needsBillingAttention ? "text-amber-700" : "text-muted-foreground"}`}>
+                    {needsBillingAttention ? "Low credits or billing issue detected." : "Manage Claude credits and invoices."}
+                  </div>
+                  <a
+                    href="https://platform.claude.com/settings/billing"
+                    target="_blank"
+                    rel="noreferrer"
+                    className="mt-2 inline-flex items-center gap-1 rounded-lg border border-border px-2 py-1 text-[11px] font-medium hover:bg-accent"
+                  >
+                    {needsBillingAttention ? "Recharge Now" : "Open Billing"}
+                    <ExternalLink className="h-3 w-3" />
+                  </a>
+                </div>
+              )}
             </div>
 
             <div className="rounded-2xl bg-muted/50 p-3">

@@ -1,7 +1,7 @@
 """Dashboard endpoint: pipeline status, health, and summary."""
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
+from sqlalchemy import select, func, or_
 from app.database import get_db
 from app.dependencies import get_current_user
 from app.models.user import User
@@ -11,6 +11,7 @@ from app.models.keyword import Keyword
 from app.models.app import App
 from app.models.user_app_access import UserAppAccess
 from app.services.pipeline_tracking import current_step_label, parse_step_log
+from app.services.runtime_config import is_true, load_runtime_config
 
 router = APIRouter()
 
@@ -20,51 +21,81 @@ async def get_dashboard(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """Return dashboard summary: latest pipeline runs, suggestion counts, health."""
+    """Return dashboard summary: latest pipeline runs, suggestion counts, health, and mode flags."""
 
-    # Latest pipeline run per app
+    # --- Load apps accessible to this user ---
     app_query = select(App).order_by(App.id)
-    if user.role == "sub_admin":
+    if user.role in {"admin", "sub_admin"}:
         app_query = (
             select(App)
-            .join(UserAppAccess, UserAppAccess.app_id == App.id)
-            .where(UserAppAccess.user_id == user.id)
+            .outerjoin(
+                UserAppAccess,
+                (UserAppAccess.app_id == App.id) & (UserAppAccess.user_id == user.id),
+            )
+            .where(or_(App.owner_user_id == user.id, UserAppAccess.user_id == user.id))
             .order_by(App.id)
+            .distinct()
         )
     apps_result = await db.execute(app_query)
     apps = apps_result.scalars().all()
+    app_ids = [a.id for a in apps]
 
+    if not app_ids:
+        return {
+            "apps": [],
+            "total_pending_suggestions": 0,
+            "health": {"database": "ok", "api": "ok"},
+            "mode": {"dry_run": True, "manual_approval_required": True},
+        }
+
+    # --- Bulk: latest pipeline run per app (one query) ---
+    latest_run_subq = (
+        select(func.max(PipelineRun.id).label("max_id"))
+        .where(PipelineRun.app_id.in_(app_ids))
+        .group_by(PipelineRun.app_id)
+        .subquery()
+    )
+    runs_result = await db.execute(
+        select(PipelineRun).where(PipelineRun.id.in_(select(latest_run_subq.c.max_id)))
+    )
+    runs_by_app: dict[int, PipelineRun] = {r.app_id: r for r in runs_result.scalars().all()}
+
+    # --- Bulk: pending suggestion counts per app ---
+    pending_result = await db.execute(
+        select(Suggestion.app_id, func.count().label("cnt"))
+        .where(Suggestion.app_id.in_(app_ids))
+        .where(Suggestion.status == "pending")
+        .group_by(Suggestion.app_id)
+    )
+    pending_by_app: dict[int, int] = {row.app_id: row.cnt for row in pending_result}
+
+    # --- Bulk: approved suggestion counts per app ---
+    approved_result = await db.execute(
+        select(Suggestion.app_id, func.count().label("cnt"))
+        .where(Suggestion.app_id.in_(app_ids))
+        .where(Suggestion.status == "approved")
+        .group_by(Suggestion.app_id)
+    )
+    approved_by_app: dict[int, int] = {row.app_id: row.cnt for row in approved_result}
+
+    # --- Bulk: active keyword counts per app ---
+    kw_result = await db.execute(
+        select(Keyword.app_id, func.count().label("cnt"))
+        .where(Keyword.app_id.in_(app_ids))
+        .where(Keyword.status == "active")
+        .group_by(Keyword.app_id)
+    )
+    keywords_by_app: dict[int, int] = {row.app_id: row.cnt for row in kw_result}
+
+    # --- Mode flags from runtime config ---
+    config = await db.run_sync(load_runtime_config)
+    dry_run_mode = is_true(config.get("dry_run"), True)
+    manual_approval_required = is_true(config.get("manual_approval_required"), True)
+
+    # --- Build per-app summaries ---
     pipeline_summaries = []
     for app in apps:
-        latest_run = await db.execute(
-            select(PipelineRun)
-            .where(PipelineRun.app_id == app.id)
-            .order_by(PipelineRun.id.desc())
-            .limit(1)
-        )
-        run = latest_run.scalar_one_or_none()
-
-        approved_count_result = await db.execute(
-            select(func.count()).select_from(Suggestion)
-            .where(Suggestion.app_id == app.id)
-            .where(Suggestion.status == "approved")
-        )
-        approved_count = approved_count_result.scalar() or 0
-
-        pending_count_result = await db.execute(
-            select(func.count()).select_from(Suggestion)
-            .where(Suggestion.app_id == app.id)
-            .where(Suggestion.status == "pending")
-        )
-        pending_count = pending_count_result.scalar() or 0
-
-        keywords_count_result = await db.execute(
-            select(func.count()).select_from(Keyword)
-            .where(Keyword.app_id == app.id)
-            .where(Keyword.status == "active")
-        )
-        keywords_count = keywords_count_result.scalar() or 0
-
+        run = runs_by_app.get(app.id)
         step_log = parse_step_log(run.step_log if run else None)
         current_label = current_step_label(step_log, run.error_message if run else None)
 
@@ -73,9 +104,9 @@ async def get_dashboard(
             "app_name": app.name,
             "package_name": app.package_name,
             "app_status": app.status,
-            "pending_suggestions": pending_count,
-            "approved_suggestions": approved_count,
-            "active_keywords": keywords_count,
+            "pending_suggestions": pending_by_app.get(app.id, 0),
+            "approved_suggestions": approved_by_app.get(app.id, 0),
+            "active_keywords": keywords_by_app.get(app.id, 0),
             "last_pipeline": {
                 "id": run.id if run else None,
                 "status": run.status if run else "never_run",
@@ -103,17 +134,14 @@ async def get_dashboard(
             } if run else None,
         })
 
-    # Overall counts
-    total_pending_result = await db.execute(
-        select(func.count()).select_from(Suggestion).where(Suggestion.status == "pending")
-    )
-    total_pending = total_pending_result.scalar() or 0
+    total_pending = sum(pending_by_app.get(aid, 0) for aid in app_ids)
 
     return {
         "apps": pipeline_summaries,
         "total_pending_suggestions": total_pending,
-        "health": {
-            "database": "ok",
-            "api": "ok",
+        "health": {"database": "ok", "api": "ok"},
+        "mode": {
+            "dry_run": dry_run_mode,
+            "manual_approval_required": manual_approval_required,
         },
     }

@@ -107,6 +107,7 @@ def track_performance(suggestion_id: int, app_id: int):
                 level="warning",
                 module="track_performance",
                 message=f"Rolled back suggestion {suggestion_id}: {reason[:200]}",
+                app_id=app_id,
             ))
             db.commit()
 
@@ -118,6 +119,7 @@ def track_performance(suggestion_id: int, app_id: int):
                 level="info",
                 module="track_performance",
                 message=f"Suggestion {suggestion_id} confirmed — no regression",
+                app_id=app_id,
             ))
             db.commit()
             return {"status": "confirmed", "suggestion_id": suggestion_id}

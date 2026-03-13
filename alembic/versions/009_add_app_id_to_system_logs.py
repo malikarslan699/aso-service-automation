@@ -1,7 +1,7 @@
 """Add app_id to system_logs for project-scoped visibility.
 
 Revision ID: 009_add_app_id_to_system_logs
-Revises: 008_suggestion_extra_data_and_review_reply_guard
+Revises: 008
 Create Date: 2026-03-13
 """
 
@@ -13,7 +13,7 @@ import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
 revision: str = "009_add_app_id_to_system_logs"
-down_revision: Union[str, None] = "008_suggestion_extra_data_and_review_reply_guard"
+down_revision: Union[str, None] = "008"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

@@ -5,10 +5,35 @@ import json
 import logging
 from datetime import datetime, timezone
 
+from redis import Redis
+
 from app.workers.celery_app import celery_app
 from app.services.publish_guard import should_skip_candidate
 
 logger = logging.getLogger(__name__)
+
+
+def _acquire_pipeline_lock(redis_url: str, app_id: int, token: str, ttl_seconds: int = 3600) -> tuple[Redis | None, str, bool]:
+    lock_key = f"pipeline_lock:app_{app_id}"
+    try:
+        redis_client = Redis.from_url(redis_url, decode_responses=True)
+        acquired = bool(redis_client.set(lock_key, token, ex=ttl_seconds, nx=True))
+        return redis_client, lock_key, acquired
+    except Exception as exc:
+        logger.warning("Pipeline lock unavailable for app %s; continuing without lock: %s", app_id, exc)
+        return None, lock_key, True
+
+
+def _release_pipeline_lock(redis_client: Redis | None, lock_key: str, token: str) -> None:
+    if redis_client is None:
+        return
+    try:
+        current_token = redis_client.get(lock_key)
+        if current_token == token:
+            redis_client.delete(lock_key)
+    except Exception as exc:
+        logger.warning("Failed to release pipeline lock %s: %s", lock_key, exc)
+
 def _dedupe_suggestions(
     validated: list[dict],
     existing_suggestions: list[dict],
@@ -99,7 +124,13 @@ def _supersede_old_pending_suggestions(app_id: int, current_pipeline_run_id: int
 
 
 @celery_app.task(name="daily_pipeline", bind=True, max_retries=2)
-def run_daily_pipeline(self, app_id: int, trigger: str = "scheduled", pipeline_run_id: int | None = None):
+def run_daily_pipeline(
+    self,
+    app_id: int,
+    trigger: str = "scheduled",
+    pipeline_run_id: int | None = None,
+    dry_run_override: bool | None = None,
+):
     from sqlalchemy import create_engine, select
     from sqlalchemy.orm import Session
 
@@ -118,6 +149,33 @@ def run_daily_pipeline(self, app_id: int, trigger: str = "scheduled", pipeline_r
 
     settings = get_settings()
     engine = create_engine(settings.database_url_sync)
+    request_id = getattr(getattr(self, "request", None), "id", "unknown")
+    lock_token = f"{request_id}:{pipeline_run_id or 'new'}"
+    redis_client, lock_key, lock_acquired = _acquire_pipeline_lock(settings.redis_url, app_id, lock_token)
+
+    if not lock_acquired:
+        logger.info("Pipeline already running for app %s, skipping duplicate dispatch.", app_id)
+        with Session(engine) as db:
+            if pipeline_run_id is not None:
+                duplicate_run = db.execute(select(PipelineRun).where(PipelineRun.id == pipeline_run_id)).scalar_one_or_none()
+                if duplicate_run and duplicate_run.status in {"queued", "running"}:
+                    duplicate_run.status = "skipped"
+                    duplicate_run.error_message = "Skipped duplicate dispatch: another pipeline is already running for this app."
+                    duplicate_run.completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                    duplicate_run.step_log = serialize_step_log(
+                        update_step(
+                            build_step_log(),
+                            "finalization",
+                            status="skipped",
+                            message=duplicate_run.error_message,
+                        )
+                    )
+                    db.commit()
+        return {
+            "status": "skipped",
+            "app_id": app_id,
+            "reason": "duplicate_pipeline_lock",
+        }
 
     def persist_run(db: Session, run: PipelineRun, step_log: list[dict]) -> None:
         run.step_log = serialize_step_log(step_log)
@@ -134,31 +192,35 @@ def run_daily_pipeline(self, app_id: int, trigger: str = "scheduled", pipeline_r
         auto_approved = 0
         high_risk = []
 
-        if pipeline_run_id is not None:
-            pipeline_run = db.execute(select(PipelineRun).where(PipelineRun.id == pipeline_run_id)).scalar_one_or_none()
-            if pipeline_run is None:
-                raise ValueError(f"PipelineRun {pipeline_run_id} not found")
-            pipeline_run.status = "running"
-            pipeline_run.trigger = trigger
-            pipeline_run.total_steps = len(step_log)
-            pipeline_run.error_message = None
-            step_log = build_step_log()
-            if pipeline_run.started_at is None:
-                pipeline_run.started_at = datetime.now(timezone.utc).replace(tzinfo=None)
-        else:
-            pipeline_run = PipelineRun(
-                app_id=app_id,
-                status="running",
-                trigger=trigger,
-                steps_completed=0,
-                total_steps=len(step_log),
-                started_at=datetime.now(timezone.utc).replace(tzinfo=None),
-            )
-            db.add(pipeline_run)
-            db.commit()
-            db.refresh(pipeline_run)
-
         try:
+            if pipeline_run_id is not None:
+                pipeline_run = db.execute(select(PipelineRun).where(PipelineRun.id == pipeline_run_id)).scalar_one_or_none()
+                if pipeline_run is None:
+                    raise ValueError(f"PipelineRun {pipeline_run_id} not found")
+                # Respect cancel requests made before the worker picked up the task
+                if pipeline_run.status == "cancelled":
+                    logger.info("Pipeline run %s was cancelled before worker started — exiting early", pipeline_run_id)
+                    return
+                pipeline_run.status = "running"
+                pipeline_run.trigger = trigger
+                pipeline_run.total_steps = len(step_log)
+                pipeline_run.error_message = None
+                step_log = build_step_log()
+                if pipeline_run.started_at is None:
+                    pipeline_run.started_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            else:
+                pipeline_run = PipelineRun(
+                    app_id=app_id,
+                    status="running",
+                    trigger=trigger,
+                    steps_completed=0,
+                    total_steps=len(step_log),
+                    started_at=datetime.now(timezone.utc).replace(tzinfo=None),
+                )
+                db.add(pipeline_run)
+                db.commit()
+                db.refresh(pipeline_run)
+
             step_log = update_step(step_log, "queue_accepted", status="completed", message="Pipeline accepted by the worker queue")
             step_log = update_step(step_log, "run_started", status="completed", message="Worker picked up the pipeline run")
             persist_run(db, pipeline_run, step_log)
@@ -176,7 +238,8 @@ def run_daily_pipeline(self, app_id: int, trigger: str = "scheduled", pipeline_r
                 return {"status": "skipped", "reason": f"App status={app.status}"}
 
             config_values = load_runtime_config(db)
-            dry_run = is_true(config_values.get("dry_run"), settings.dry_run)
+            dry_run = True if dry_run_override is True else is_true(config_values.get("dry_run"), settings.dry_run)
+            human_sim_enabled = is_true(config_values.get("human_sim_enabled"), False)
             manual_approval_required = is_true(config_values.get("manual_approval_required"), True)
             auto_approve_threshold = as_int(config_values.get("auto_approve_threshold"), 0)
             credential_rows = db.execute(
@@ -215,7 +278,28 @@ def run_daily_pipeline(self, app_id: int, trigger: str = "scheduled", pipeline_r
             )
             persist_run(db, pipeline_run, step_log)
 
-            human_simulator.pipeline_delay_sync(dry_run=dry_run)
+            pip_min = as_int(config_values.get("pipeline_delay_min_minutes"), 5)
+            pip_max = as_int(config_values.get("pipeline_delay_max_minutes"), 20)
+            delay_seconds = human_simulator.compute_pipeline_delay_seconds(
+                dry_run=dry_run,
+                enabled=human_sim_enabled,
+                min_minutes=pip_min,
+                max_minutes=pip_max,
+            )
+            if delay_seconds > 0:
+                delay_minutes = max(1, (delay_seconds + 59) // 60)
+                step_log = update_step(
+                    step_log,
+                    "keyword_discovery",
+                    status="running",
+                    message=f"Waiting {delay_minutes} min (human sim delay)",
+                )
+                persist_run(db, pipeline_run, step_log)
+                human_simulator.pipeline_delay_sync(
+                    dry_run=dry_run,
+                    enabled=human_sim_enabled,
+                    delay_seconds=delay_seconds,
+                )
 
             step_log = update_step(step_log, "keyword_discovery", status="running", message="Running keyword discovery")
             persist_run(db, pipeline_run, step_log)
@@ -385,6 +469,7 @@ def run_daily_pipeline(self, app_id: int, trigger: str = "scheduled", pipeline_r
                         )
                         apply_status_log(suggestion, suggestion_log)
                         auto_approved += 1
+                        notifier.send_auto_approve_notification(suggestion, app.name, suggestion.risk_score or 0, db)
 
             db.commit()
             step_log = update_step(
@@ -440,6 +525,19 @@ def run_daily_pipeline(self, app_id: int, trigger: str = "scheduled", pipeline_r
             pipeline_run.completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
             persist_run(db, pipeline_run, step_log)
 
+            # Pipeline completion summary to Telegram
+            publish_mode_val = (config_values.get("publish_mode") or "live").strip().lower()
+            pending_approval_count = suggestions_generated - auto_approved
+            notifier.send_pipeline_summary(
+                app_name=app.name,
+                generated=suggestions_generated,
+                pending_approval=max(0, pending_approval_count),
+                auto_approved=auto_approved,
+                publish_mode=publish_mode_val,
+                manual_approval_required=manual_approval_required,
+                db=db,
+            )
+
             return {
                 "status": pipeline_run.status,
                 "pipeline_run_id": pipeline_run.id,
@@ -456,11 +554,17 @@ def run_daily_pipeline(self, app_id: int, trigger: str = "scheduled", pipeline_r
         except Exception as exc:
             error_message = str(exc)
             logger.error("[Pipeline %s] Failed: %s", pipeline_run.id if pipeline_run else "?", exc, exc_info=True)
+            try:
+                db.rollback()
+            except Exception:
+                pass
             step_log = update_step(step_log, "finalization", status="failed", message=error_message[:1000])
             if pipeline_run:
                 pipeline_run.status = "failed"
                 pipeline_run.error_message = error_message[:1000]
                 pipeline_run.completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
                 persist_run(db, pipeline_run, step_log)
-            notifier.send_error_alert(error_message[:300], f"App {app_id}", db)
+            notifier.send_error_alert(f"Pipeline failed for app {app_id}: {error_message[:300]}", f"App {app_id}", db)
             raise self.retry(exc=exc, countdown=60 * 10)
+        finally:
+            _release_pipeline_lock(redis_client, lock_key, lock_token)

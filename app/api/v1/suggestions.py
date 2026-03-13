@@ -2,7 +2,7 @@
 import logging
 import json
 from datetime import datetime, timedelta, timezone
-from fastapi import APIRouter, Depends, HTTPException, status, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, status, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from typing import Optional
@@ -12,6 +12,8 @@ from app.models.user import User
 from app.models.suggestion import Suggestion
 from app.models.global_config import GlobalConfig
 from app.models.pipeline_run import PipelineRun
+from app.models.app import App
+from app.models.app_credential import AppCredential
 from pydantic import BaseModel
 from app.services.listing_publish_queue import (
     list_publish_jobs,
@@ -28,6 +30,7 @@ from app.services.suggestion_tracking import (
     utcnow_naive,
     update_status_stage,
 )
+from app.utils.encryption import decrypt_value
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -41,6 +44,10 @@ class RetryPublishRequest(BaseModel):
     reason: Optional[str] = None
 
 
+class PipelineTriggerRequest(BaseModel):
+    dry_run: Optional[bool] = None
+
+
 @router.get("/{app_id}/suggestions")
 async def list_suggestions(
     app_id: int,
@@ -50,6 +57,7 @@ async def list_suggestions(
     paginated: bool = Query(False),
     limit: int = Query(200, ge=1, le=500),
     offset: int = Query(0, ge=0),
+    page: Optional[int] = Query(None, ge=1),
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
@@ -69,6 +77,10 @@ async def list_suggestions(
         .where(*filters)
         .order_by(Suggestion.pipeline_run_id.is_(None), Suggestion.pipeline_run_id.desc(), Suggestion.id.desc())
     )
+
+    if page is not None:
+        paginated = True
+        offset = (page - 1) * limit
 
     if paginated:
         count_query = select(func.count()).select_from(Suggestion).where(*filters)
@@ -91,6 +103,7 @@ async def list_suggestions(
         "total": total,
         "limit": limit,
         "offset": offset,
+        "page": page if page is not None else (offset // max(limit, 1)) + 1,
         "has_more": has_more,
         "next_offset": offset + limit if has_more else None,
     }
@@ -126,6 +139,7 @@ def _serialize_suggestion(s: Suggestion) -> dict:
         "next_eligible_at": s.next_eligible_at.isoformat() if s.next_eligible_at else None,
         "publish_block_reason": s.publish_block_reason,
         "publish_error_code": _extract_publish_error_code(s.publish_message, s.publish_block_reason),
+        "google_play_edit_id": s.google_play_edit_id,
         "review_id": extra_data.get("review_id") if s.suggestion_type == "review_reply" else None,
         "extra_data": extra_data if s.suggestion_type == "review_reply" else {},
         "reviewed_by": s.reviewed_by,
@@ -550,9 +564,98 @@ async def force_reset_suggestion(
     return {"status": "reset", "suggestion_id": suggestion.id, "message": "Suggestion reset to pending."}
 
 
+@router.post("/{app_id}/suggestions/{suggestion_id}/go-live")
+async def go_live_suggestion(
+    app_id: int,
+    suggestion_id: int,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_role("admin")),
+):
+    await ensure_app_access(db, user, app_id)
+    suggestion = await _get_suggestion(app_id, suggestion_id, db, for_update=True)
+
+    if suggestion.publish_status != "soft_published":
+        raise HTTPException(status_code=400, detail="Suggestion is not in soft_published state.")
+    if not suggestion.google_play_edit_id:
+        raise HTTPException(status_code=400, detail="No Google Play draft edit is available for this suggestion.")
+
+    app = (
+        await db.execute(select(App).where(App.id == app_id))
+    ).scalar_one_or_none()
+    if app is None:
+        raise HTTPException(status_code=404, detail="App not found")
+
+    cred_row = (
+        await db.execute(
+            select(AppCredential)
+            .where(AppCredential.app_id == app_id)
+            .where(AppCredential.credential_type == "service_account_json")
+        )
+    ).scalar_one_or_none()
+    if cred_row is None:
+        raise HTTPException(status_code=400, detail="Google Play credential is missing for this app.")
+
+    try:
+        credential_json = decrypt_value(cred_row.value)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="Google Play credential decryption failed.") from exc
+
+    from app.services import data_fetcher
+
+    result = data_fetcher.commit_listing_edit(
+        package_name=app.package_name,
+        credential_json=credential_json,
+        edit_id=suggestion.google_play_edit_id,
+    )
+
+    now = utcnow_naive()
+    suggestion.last_transition_at = now
+    suggestion.publish_completed_at = now
+    suggestion.publish_message = result.get("message")
+    if result.get("success"):
+        suggestion.status = "published"
+        suggestion.publish_status = "published"
+        suggestion.published_live = True
+        suggestion.is_dry_run_result = False
+        suggestion.published_at = now
+        suggestion.publish_block_reason = None
+        suggestion.google_play_edit_id = None
+    else:
+        suggestion.status = "approved"
+        suggestion.publish_status = "blocked" if result.get("status") == "blocked" else "failed"
+        suggestion.publish_block_reason = result.get("message")
+
+    status_log = hydrate_status_log(suggestion)
+    status_log = update_status_stage(
+        status_log,
+        "publish_attempted",
+        status="completed" if result.get("success") else ("blocked" if suggestion.publish_status == "blocked" else "failed"),
+        message=suggestion.publish_message or "Go-live attempt finished.",
+        actor=user.username,
+        occurred_at=now,
+    )
+    status_log = update_status_stage(
+        status_log,
+        "publish_result",
+        status="completed" if result.get("success") else ("blocked" if suggestion.publish_status == "blocked" else "failed"),
+        message=suggestion.publish_message or "Go-live attempt finished.",
+        actor=user.username,
+        occurred_at=now,
+    )
+    apply_status_log(suggestion, status_log)
+
+    await db.commit()
+    return {
+        "status": suggestion.publish_status,
+        "suggestion_id": suggestion.id,
+        "message": suggestion.publish_message,
+    }
+
+
 @router.post("/{app_id}/pipeline/trigger")
 async def trigger_pipeline(
     app_id: int,
+    request: PipelineTriggerRequest | None = Body(default=None),
     db: AsyncSession = Depends(get_db),
     user: User = Depends(require_any_role("admin", "sub_admin")),
 ):
@@ -584,7 +687,8 @@ async def trigger_pipeline(
 
     from app.workers.celery_app import celery_app
     config = await db.run_sync(load_runtime_config)
-    dry_run_enabled = is_true(config.get("dry_run"), True)
+    requested_dry_run = request.dry_run if request else None
+    dry_run_enabled = True if requested_dry_run is True else is_true(config.get("dry_run"), True)
     manual_approval_required = is_true(config.get("manual_approval_required"), True)
 
     pipeline_run = PipelineRun(
@@ -606,9 +710,15 @@ async def trigger_pipeline(
         task = celery_app.send_task(
             "daily_pipeline",
             args=[app_id],
-            kwargs={"trigger": "manual", "pipeline_run_id": pipeline_run.id},
+            kwargs={
+                "trigger": "manual",
+                "pipeline_run_id": pipeline_run.id,
+                "dry_run_override": True if requested_dry_run is True else None,
+            },
             ignore_result=True,
         )
+        pipeline_run.celery_task_id = task.id
+        await db.commit()
     except Exception as exc:
         pipeline_run.status = "failed"
         pipeline_run.error_message = str(exc)[:1000]
@@ -626,6 +736,33 @@ async def trigger_pipeline(
         "execution_mode": "demo" if dry_run_enabled else "live",
         "workflow_mode": "manual_approval" if manual_approval_required else "auto_rules",
     }
+
+
+@router.post("/{app_id}/pipeline/cancel")
+async def cancel_pipeline(
+    app_id: int,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_any_role("admin", "sub_admin")),
+):
+    """Cancel a queued or running pipeline for an app."""
+    await ensure_app_access(db, user, app_id)
+    run = await _get_running_pipeline(app_id, db)
+    if not run:
+        raise HTTPException(status_code=404, detail="No active pipeline to cancel")
+
+    # Try to revoke the Celery task (terminate if running)
+    if run.celery_task_id:
+        try:
+            from app.workers.celery_app import celery_app as _celery
+            _celery.control.revoke(run.celery_task_id, terminate=True, signal="SIGTERM")
+        except Exception:
+            pass  # Best-effort — DB status update is the authoritative cancel
+
+    run.status = "cancelled"
+    run.completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    run.error_message = f"Cancelled by {user.username}"
+    await db.commit()
+    return {"status": "cancelled", "pipeline_run_id": run.id}
 
 
 async def _get_suggestion(app_id: int, suggestion_id: int, db: AsyncSession, for_update: bool = False) -> Suggestion:
@@ -686,24 +823,43 @@ def _normalize_utc(value: Optional[datetime]) -> datetime:
 
 
 async def _expire_stale_queued_runs(app_id: int, db: AsyncSession) -> None:
-    cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=5)
-    result = await db.execute(
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    queued_cutoff = now - timedelta(minutes=5)
+    queued_result = await db.execute(
         select(PipelineRun)
         .where(PipelineRun.app_id == app_id)
         .where(PipelineRun.status == "queued")
         .where(PipelineRun.steps_completed == 0)
-        .where(PipelineRun.started_at < cutoff)
+        .where(PipelineRun.started_at < queued_cutoff)
     )
-    stale_runs = result.scalars().all()
-    if not stale_runs:
+    queued_runs = queued_result.scalars().all()
+
+    running_cutoff = now - timedelta(minutes=30)
+    running_result = await db.execute(
+        select(PipelineRun)
+        .where(PipelineRun.app_id == app_id)
+        .where(PipelineRun.status == "running")
+        .where(PipelineRun.updated_at < running_cutoff)
+    )
+    running_runs = running_result.scalars().all()
+
+    if not queued_runs and not running_runs:
         return
 
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
-    for run in stale_runs:
+    for run in queued_runs:
         run.status = "failed"
         run.error_message = "Queue timeout: worker did not start this pipeline."
         run.completed_at = now
         run.step_log = serialize_step_log(
             update_step(build_step_log(), "finalization", status="failed", message=run.error_message)
         )
+
+    for run in running_runs:
+        run.status = "failed"
+        run.error_message = "Run timeout: no worker heartbeat for 30+ minutes."
+        run.completed_at = now
+        run.step_log = serialize_step_log(
+            update_step(build_step_log(), "finalization", status="failed", message=run.error_message)
+        )
+
     await db.commit()

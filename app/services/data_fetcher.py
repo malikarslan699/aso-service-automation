@@ -7,6 +7,7 @@ logger = logging.getLogger(__name__)
 
 GOOGLE_ERROR_CODES = {
     "missing_review_id",
+    "missing_edit_id",
     "missing_default_language_title",
     "google_api_not_found",
     "google_api_forbidden",
@@ -220,6 +221,7 @@ def publish_listing(
     short_description: Optional[str] = None,
     long_description: Optional[str] = None,
     dry_run: bool = True,
+    commit_edit: bool = True,
 ) -> dict:
     """Publish updated listing to Google Play via API.
 
@@ -240,7 +242,7 @@ def publish_listing(
             f"[DRY RUN] Would publish to {package_name}: "
             f"title={title!r} short={short_preview}"
         )
-        return {"success": True, "dry_run": True, "message": "Dry run — no actual publish"}
+        return {"success": True, "dry_run": True, "status": "dry_run_only", "message": "Dry run — no actual publish"}
 
     try:
         from app.config import get_settings
@@ -264,10 +266,24 @@ def publish_listing(
                 status="blocked",
             )
 
-        current_listing = _read_current_listing(service, package_name, edit_id, default_language)
-        resolved_title = title if title is not None else current_listing.get("title", "")
-        resolved_short = short_description if short_description is not None else current_listing.get("shortDescription", "")
-        resolved_long = long_description if long_description is not None else current_listing.get("fullDescription", "")
+        existing_listing = _read_current_listing(service, package_name, edit_id, default_language)
+        merged_listing: dict[str, Any] = {
+            "language": default_language,
+            "title": str(existing_listing.get("title", "") or ""),
+            "shortDescription": str(existing_listing.get("shortDescription", "") or ""),
+            "fullDescription": str(existing_listing.get("fullDescription", "") or ""),
+        }
+
+        if title is not None:
+            merged_listing["title"] = title
+        if short_description is not None:
+            merged_listing["shortDescription"] = short_description
+        if long_description is not None:
+            merged_listing["fullDescription"] = long_description
+
+        resolved_title = str(merged_listing.get("title", "") or "")
+        resolved_short = str(merged_listing.get("shortDescription", "") or "")
+        resolved_long = str(merged_listing.get("fullDescription", "") or "")
 
         if not resolved_title.strip():
             return _build_error_result(
@@ -277,29 +293,79 @@ def publish_listing(
                 status="blocked",
             )
 
-        listing_body: dict[str, Any] = {"title": resolved_title}
-        if resolved_short:
-            listing_body["shortDescription"] = resolved_short
-        if resolved_long:
-            listing_body["fullDescription"] = resolved_long
+        merged_listing["title"] = resolved_title
+        merged_listing["shortDescription"] = resolved_short
+        merged_listing["fullDescription"] = resolved_long
 
         service.edits().listings().update(
             packageName=package_name,
             editId=edit_id,
             language=default_language,
-            body=listing_body,
+            body=merged_listing,
         ).execute()
 
-        # Commit edit
+        if not commit_edit:
+            logger.info("Saved draft listing edit %s for %s (soft publish mode)", edit_id, package_name)
+            return {
+                "success": True,
+                "dry_run": False,
+                "status": "soft_published",
+                "edit_id": edit_id,
+                "message": "Listing saved as draft edit (not committed).",
+            }
+
+        # Commit edit for live publish
         service.edits().commit(packageName=package_name, editId=edit_id).execute()
 
         logger.info(f"Successfully published listing for {package_name}")
-        return {"success": True, "dry_run": False, "status": "published", "message": "Published successfully"}
+        return {
+            "success": True,
+            "dry_run": False,
+            "status": "published",
+            "edit_id": edit_id,
+            "message": "Published successfully",
+        }
 
     except Exception as exc:
         logger.error(f"Failed to publish listing for {package_name}: {exc}")
         error_code, message = _normalize_google_api_error(exc)
         status = "blocked" if error_code in {"missing_default_language_title", "google_api_forbidden", "google_api_not_found"} else "failed"
+        return _build_error_result(error_code=error_code, message=message, dry_run=False, status=status)
+
+
+def commit_listing_edit(
+    package_name: str,
+    credential_json: str,
+    edit_id: str,
+) -> dict:
+    if not edit_id:
+        return _build_error_result(
+            error_code="missing_edit_id",
+            message="No Google Play edit_id is available to commit.",
+            dry_run=False,
+            status="blocked",
+        )
+
+    try:
+        from app.config import get_settings
+
+        settings = get_settings()
+        service = _build_androidpublisher_service(
+            credential_json=credential_json,
+            discovery_url=settings.google_api_discovery_url or None,
+        )
+        service.edits().commit(packageName=package_name, editId=edit_id).execute()
+        return {
+            "success": True,
+            "dry_run": False,
+            "status": "published",
+            "edit_id": edit_id,
+            "message": "Draft edit committed to Google Play.",
+        }
+    except Exception as exc:
+        logger.error("Failed to commit listing edit %s for %s: %s", edit_id, package_name, exc)
+        error_code, message = _normalize_google_api_error(exc)
+        status = "blocked" if error_code in {"google_api_not_found", "google_api_forbidden"} else "failed"
         return _build_error_result(error_code=error_code, message=message, dry_run=False, status=status)
 
 
@@ -319,7 +385,8 @@ def reply_to_review(
         logger.info(f"[DRY RUN] Would reply to review {review_id} on {package_name}: {reply_text[:50]!r}")
         return {"success": True, "dry_run": True, "status": "dry_run_only", "message": "Dry run — no actual reply"}
 
-    if not review_id or not review_id.strip() or review_id.strip() == ":":
+    clean_review_id = (review_id or "").strip()
+    if not clean_review_id or clean_review_id == ":":
         return _build_error_result(
             error_code="missing_review_id",
             message="Review reply is missing review_id metadata. Regenerate this suggestion from a fresh pipeline run.",
@@ -338,7 +405,7 @@ def reply_to_review(
 
         service.reviews().reply(
             packageName=package_name,
-            reviewId=review_id,
+            reviewId=clean_review_id,
             body={"replyText": reply_text},
         ).execute()
 

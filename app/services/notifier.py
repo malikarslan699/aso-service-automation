@@ -133,3 +133,91 @@ def send_rollback_alert(suggestion, app_name: str, reason: str, db) -> bool:
         f"Reason: {reason}"
     )
     return _send_message(bot_token, chat_id, text)
+
+
+def send_soft_publish_notification(suggestion, app_name: str, db) -> bool:
+    """Notify that a suggestion was soft-published (draft saved, NOT live)."""
+    bot_token, chat_id = _get_bot_config(db)
+
+    field = getattr(suggestion, "field_name", "unknown")
+    new_val = str(getattr(suggestion, "new_value", ""))[:120]
+    text = (
+        f"<b>📋 Draft Saved — {app_name}</b>\n"
+        f"Field: <code>{field}</code>\n"
+        f"Value: {new_val}\n\n"
+        f"ℹ️ <i>Not live yet — approve &amp; go-live to publish to Google Play.</i>"
+    )
+    return _send_message(bot_token, chat_id, text)
+
+
+def send_pipeline_summary(
+    app_name: str,
+    generated: int,
+    pending_approval: int,
+    auto_approved: int,
+    publish_mode: str,
+    manual_approval_required: bool,
+    db,
+) -> bool:
+    """Send pipeline completion summary with counts and mode."""
+    bot_token, chat_id = _get_bot_config(db)
+
+    mode_label = "Auto (no approval needed)" if not manual_approval_required else (
+        "Soft Publish" if publish_mode == "soft" else "Live Publish"
+    )
+
+    lines = [f"<b>✅ Pipeline Complete — {app_name}</b>", ""]
+    lines.append(f"🧠 Suggestions generated: <b>{generated}</b>")
+    if auto_approved > 0:
+        lines.append(f"🤖 Auto-approved &amp; queued: <b>{auto_approved}</b>")
+    if pending_approval > 0:
+        lines.append(f"⏳ Pending your approval: <b>{pending_approval}</b>")
+    if generated == 0:
+        lines.append("💤 No new suggestions this run")
+    lines.append(f"\n📋 Mode: <i>{mode_label}</i>")
+
+    return _send_message(bot_token, chat_id, "\n".join(lines))
+
+
+def send_auto_approve_notification(suggestion, app_name: str, risk_score: int, db) -> bool:
+    """Notify when a suggestion is auto-approved and queued for publish."""
+    bot_token, chat_id = _get_bot_config(db)
+
+    field = getattr(suggestion, "field_name", "unknown")
+    text = (
+        f"<b>🤖 Auto-Approved — {app_name}</b>\n"
+        f"Field: <code>{field}</code>\n"
+        f"Risk score: {risk_score}/5 — queued for publish"
+    )
+    return _send_message(bot_token, chat_id, text)
+
+
+def send_publish_blocked(app_name: str, reason: str, db) -> bool:
+    """Notify when a publish was blocked (limit reached, outside window, etc.)."""
+    bot_token, chat_id = _get_bot_config(db)
+
+    text = (
+        f"<b>⚠️ Publish Blocked — {app_name}</b>\n"
+        f"Reason: {reason}"
+    )
+    return _send_message(bot_token, chat_id, text)
+
+
+def send_telegram_test(bot_token: str, chat_id: str) -> dict:
+    """Send a test message to verify Telegram is configured correctly.
+
+    Returns dict with 'sent' bool and 'message' string.
+    Uses provided credentials directly (not from DB).
+    """
+    if not bot_token or not chat_id:
+        return {"sent": False, "message": "Bot token or chat ID not configured."}
+
+    text = (
+        "🔔 <b>ASO Service — Test Message</b>\n\n"
+        "✅ Telegram notifications are working correctly!\n"
+        "<i>You will receive pipeline summaries, publish confirmations, and alerts here.</i>"
+    )
+    ok = _send_message(bot_token, chat_id, text)
+    if ok:
+        return {"sent": True, "message": "Test message delivered successfully."}
+    return {"sent": False, "message": "Failed to send. Check bot token and chat ID."}

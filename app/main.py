@@ -5,6 +5,9 @@ from app.api.v1.router import api_router
 from app.auth.router import auth_router
 from app.config import get_settings
 
+_settings = get_settings()
+_is_production = _settings.environment.strip().lower() == "production"
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -16,9 +19,10 @@ app = FastAPI(
     description="AI-powered App Store Optimization",
     version="1.0.0",
     lifespan=lifespan,
+    docs_url=None if _is_production else "/docs",
+    redoc_url=None if _is_production else "/redoc",
+    openapi_url=None if _is_production else "/openapi.json",
 )
-
-_settings = get_settings()
 _origins = [o.strip() for o in _settings.allowed_origins.split(",") if o.strip()]
 
 app.add_middleware(
@@ -49,7 +53,7 @@ async def health_detailed():
 
     # Database check
     try:
-        from app.database import async_engine
+        from app.database import engine as async_engine
         async with async_engine.connect() as conn:
             await conn.execute(text("SELECT 1"))
         results["database"] = "ok"

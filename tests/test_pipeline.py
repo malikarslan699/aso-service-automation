@@ -4,6 +4,7 @@ import json
 from unittest.mock import patch, MagicMock
 from app.services.safety_validator import validate
 from app.services.auto_approve_engine import should_auto_approve, update_rules
+from app.services import human_simulator
 
 
 # --- Safety Validator Integration ---
@@ -164,3 +165,14 @@ class TestPipelineDataFlow:
 
         assert restored["passed"] == result["passed"]
         assert restored["risk_score"] == result["risk_score"]
+
+
+def test_human_simulator_pipeline_delay_disabled_skips_sleep(monkeypatch):
+    called = {"sleep": None}
+
+    def _fake_sleep(seconds):
+        called["sleep"] = seconds
+
+    monkeypatch.setattr("time.sleep", _fake_sleep)
+    assert human_simulator.pipeline_delay_sync(dry_run=False, enabled=False) == 0
+    assert called["sleep"] is None

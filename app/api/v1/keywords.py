@@ -1,7 +1,8 @@
 """Keywords endpoints: list, competitor analysis, discovery trigger."""
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, func
+from typing import Optional
 from app.database import get_db
 from app.dependencies import get_current_user, require_any_role, ensure_app_access
 from app.models.user import User
@@ -14,21 +15,38 @@ router = APIRouter()
 @router.get("/{app_id}/keywords")
 async def list_keywords(
     app_id: int,
+    page: Optional[int] = Query(None, ge=1),
+    limit: int = Query(100, ge=1, le=500),
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
     """List tracked keywords for an app, sorted by opportunity score."""
     await ensure_app_access(db, user, app_id)
-    result = await db.execute(
+    query = (
         select(Keyword)
         .where(Keyword.app_id == app_id)
         .where(Keyword.status == "active")
         .order_by(Keyword.opportunity_score.desc())
-        .limit(100)
     )
+
+    total = None
+    if page is not None:
+        total = (
+            await db.execute(
+                select(func.count())
+                .select_from(Keyword)
+                .where(Keyword.app_id == app_id)
+                .where(Keyword.status == "active")
+            )
+        ).scalar_one()
+        query = query.offset((page - 1) * limit).limit(limit)
+    else:
+        query = query.limit(limit)
+
+    result = await db.execute(query)
     keywords = result.scalars().all()
 
-    return [
+    payload = [
         {
             "id": kw.id,
             "keyword": kw.keyword,
@@ -42,6 +60,17 @@ async def list_keywords(
         }
         for kw in keywords
     ]
+
+    if page is None:
+        return payload
+
+    return {
+        "items": payload,
+        "total": total or 0,
+        "page": page,
+        "limit": limit,
+        "has_more": (page * limit) < (total or 0),
+    }
 
 
 @router.get("/{app_id}/keywords/competitors")

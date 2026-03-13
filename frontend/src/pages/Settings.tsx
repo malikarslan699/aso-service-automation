@@ -120,81 +120,33 @@ const CONTROL_FIELDS: Array<{
   {
     key: "dry_run",
     title: "Execution mode",
-    description: "Choose whether publish actions simulate or perform real Google Play work.",
-    helper: "Demo mode is safe for testing. Live mode allows approved actions to go out for real.",
+    description: "Switch between Demo (safe simulation) and Live (real Google Play actions).",
+    helper: "Use Demo mode for testing — no real changes are sent to Google Play.",
     icon: Rocket,
     type: "boolean",
     trueLabel: "Demo mode",
     falseLabel: "Live mode",
   },
   {
-    key: "manual_approval_required",
-    title: "Manual approval required",
-    description: "Keep every new suggestion in Approvals until a human confirms it.",
-    helper: "Leave this on while validating prompts and provider behavior.",
-    icon: KeyRound,
-    type: "boolean",
-    trueLabel: "Required",
-    falseLabel: "Optional",
-  },
-  {
-    key: "publish_after_approval",
-    title: "Publish after approval",
-    description: "Send approved suggestions to the publish queue automatically.",
-    helper: "When enabled, manual approval becomes the final gate before backend queues the publish job.",
-    icon: Rocket,
-    type: "boolean",
-    trueLabel: "Queue automatically",
-    falseLabel: "Keep approved only",
-  },
-  {
     key: "manual_trigger_cooldown_minutes",
-    title: "Run now cooldown",
-    description: "Minimum wait time between manual runs for the same project.",
-    helper: "Keep this at 0 while testing. Raise it again before production.",
+    title: "Run Now cooldown (minutes)",
+    description: "Minimum wait time between manual pipeline runs for the same project.",
+    helper: "Set to 0 for testing. Increase for production to avoid accidental double-runs.",
     icon: Settings2,
   },
   {
     key: "listing_publish_max_per_day",
-    title: "Listing daily cap",
-    description: "Maximum listing bundle dispatches allowed per day.",
-    helper: "Keep low for policy-safe cadence.",
+    title: "Max publishes per day",
+    description: "Maximum number of listing updates allowed in one day.",
+    helper: "Keeps publishing frequency within Google Play policy guidelines.",
     icon: Settings2,
   },
   {
     key: "listing_publish_max_per_week",
-    title: "Listing weekly cap",
-    description: "Maximum listing bundle dispatches allowed per week.",
-    helper: "Prevents aggressive metadata churn.",
+    title: "Max publishes per week",
+    description: "Maximum number of listing updates allowed in one week.",
+    helper: "Prevents aggressive metadata changes that could hurt app store ranking.",
     icon: Settings2,
-  },
-  {
-    key: "listing_publish_min_gap_minutes",
-    title: "Listing min gap (minutes)",
-    description: "Hard minimum time gap between listing bundle executions.",
-    helper: "Use >= 60 minutes for human-like dispatch behavior.",
-    icon: Settings2,
-  },
-  {
-    key: "listing_publish_jitter_min_seconds",
-    title: "Jitter min (seconds)",
-    description: "Minimum random delay added before dispatch.",
-    helper: "Prevents perfectly periodic bot-like timing.",
-    icon: Settings2,
-  },
-  {
-    key: "listing_publish_jitter_max_seconds",
-    title: "Jitter max (seconds)",
-    description: "Maximum random delay added before dispatch.",
-    helper: "Must stay greater than or equal to jitter min.",
-    icon: Settings2,
-  },
-  {
-    key: "auto_approve_threshold",
-    title: "Auto-approve threshold",
-    description: "Maximum risk score allowed for auto-approval when manual approval is off.",
-    helper: "Keep this low until you trust the workflow.",
-    icon: KeyRound,
   },
 ]
 
@@ -260,6 +212,8 @@ export function Settings() {
   const [providerDrafts, setProviderDrafts] = useState<Record<string, Record<string, string>>>({})
   const [controlDrafts, setControlDrafts] = useState<Record<string, string>>({})
   const [projectKeyDrafts, setProjectKeyDrafts] = useState({ anthropic_api_key: "", openai_api_key: "" })
+  const [editingTiming, setEditingTiming] = useState(false)
+  const [timingDraft, setTimingDraft] = useState({ human_sim_enabled: "", pipeline_delay_min_minutes: "", pipeline_delay_max_minutes: "", publish_delay_min_minutes: "", publish_delay_max_minutes: "" })
 
   const { data: configs = [], isLoading } = useQuery<ConfigItem[]>({
     queryKey: ["settings"],
@@ -315,10 +269,40 @@ export function Settings() {
     },
   })
 
+  const saveTimingSettings = useMutation({
+    mutationFn: async (draft: typeof timingDraft) => {
+      await Promise.all(
+        Object.entries(draft)
+          .filter(([, v]) => v !== "")
+          .map(([key, value]) => api.put("/api/v1/settings/global", { key, value }))
+      )
+    },
+    onSuccess: () => {
+      setEditingTiming(false)
+      qc.invalidateQueries({ queryKey: ["settings"] })
+    },
+  })
+
+  const updatePublishMode = useMutation({
+    mutationFn: (target: "manual" | "auto") =>
+      api.patch("/api/v1/settings/publish-mode", {
+        mode: "live",
+        auto_approve: target === "auto",
+      }).then((r) => r.data),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["settings"] }),
+  })
+
+  const isManualApproval = (configMap.get("manual_approval_required")?.value ?? "true") !== "false"
+  const publishModeActive: "manual" | "auto" = isManualApproval ? "manual" : "auto"
+
   const checkIntegration = useMutation({
     mutationFn: (provider: string) =>
       api.post("/api/v1/settings/integrations/check", { provider, app_id: selectedApp?.id }).then((response) => response.data),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["integration-status"] }),
+  })
+
+  const testTelegram = useMutation({
+    mutationFn: () => api.post("/api/v1/settings/integrations/telegram/test").then((response) => response.data),
   })
 
   const uploadCredential = useMutation({
@@ -578,14 +562,31 @@ export function Settings() {
                     </div>
                   )}
 
-                  <button
-                    type="button"
-                    disabled={checkIntegration.isPending}
-                    onClick={() => checkIntegration.mutate(integration.provider)}
-                    className="rounded-2xl border border-border px-4 py-2 text-sm transition-colors hover:bg-accent disabled:opacity-50"
-                  >
-                    {checkIntegration.isPending ? "Checking..." : "Check provider"}
-                  </button>
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      disabled={checkIntegration.isPending}
+                      onClick={() => checkIntegration.mutate(integration.provider)}
+                      className="rounded-2xl border border-border px-4 py-2 text-sm transition-colors hover:bg-accent disabled:opacity-50"
+                    >
+                      {checkIntegration.isPending ? "Checking..." : "Check provider"}
+                    </button>
+                    {integration.provider === "telegram" && (
+                      <button
+                        type="button"
+                        disabled={testTelegram.isPending}
+                        onClick={() => testTelegram.mutate()}
+                        className="rounded-2xl border border-border px-4 py-2 text-sm transition-colors hover:bg-accent disabled:opacity-50"
+                      >
+                        {testTelegram.isPending ? "Sending..." : "Send Test Message"}
+                      </button>
+                    )}
+                  </div>
+                  {integration.provider === "telegram" && testTelegram.data && (
+                    <div className={`rounded-2xl px-4 py-2 text-sm ${testTelegram.data.sent ? "bg-green-500/10 text-green-700" : "bg-red-500/10 text-red-600"}`}>
+                      {testTelegram.data.sent ? "✅ " : "❌ "}{testTelegram.data.message}
+                    </div>
+                  )}
                 </div>
               </div>
             )
@@ -640,8 +641,68 @@ export function Settings() {
         <div>
           <h2 className="text-2xl font-bold">Workflow Controls</h2>
           <p className="mt-1 text-sm text-muted-foreground">
-            These controls explain what each setting does, so testing and live mode do not feel ambiguous.
+            Control how the pipeline runs, when it publishes, and how much automation is allowed.
           </p>
+        </div>
+
+        <details className="rounded-2xl border border-border bg-muted/40 px-5 py-4">
+          <summary className="cursor-pointer text-sm font-medium text-foreground select-none">
+            📋 Recommended production settings
+          </summary>
+          <ul className="mt-3 space-y-1.5 text-sm text-muted-foreground">
+            <li>✅ <strong>Execution mode:</strong> Live — turn off Demo when ready for real Google Play actions</li>
+            <li>✅ <strong>Publish mode:</strong> Manual — review each AI suggestion before it goes live</li>
+            <li>✅ <strong>Human-like timing:</strong> ON — random delays before publishing (looks natural)</li>
+            <li>✅ <strong>Publish window:</strong> 9AM–10PM UTC enforced automatically when timing is ON</li>
+            <li>✅ <strong>Max per day:</strong> 1 listing update (safe for Google Play policy)</li>
+            <li>✅ <strong>Max per week:</strong> 5 listing updates</li>
+            <li>✅ <strong>Run Now cooldown:</strong> 30 minutes between manual runs</li>
+            <li>✅ <strong>Telegram alerts:</strong> Configure bot token + chat ID for all notifications</li>
+          </ul>
+        </details>
+
+        {/* Publish Mode card — mirrors Dashboard Manual/Auto toggle */}
+        <div className="panel p-5">
+          <div className="flex items-start justify-between gap-4">
+            <div className="flex gap-3">
+              <div className="flex h-11 w-11 items-center justify-center rounded-2xl bg-primary/10 text-primary">
+                <Rocket className="h-5 w-5" />
+              </div>
+              <div>
+                <h3 className="text-lg font-semibold">Publish Mode</h3>
+                <p className="text-sm text-muted-foreground">Controls whether suggestions require your approval before publishing to Google Play.</p>
+              </div>
+            </div>
+          </div>
+          <div className="mt-4 rounded-2xl bg-muted/60 p-4">
+            <div className="text-xs uppercase tracking-[0.16em] text-muted-foreground">Current mode</div>
+            <div className="mt-2 text-lg font-semibold">{publishModeActive === "manual" ? "Manual — Approval required" : "Auto — Fully automated"}</div>
+            <p className="mt-1 text-sm text-muted-foreground">
+              {publishModeActive === "manual"
+                ? "AI generates suggestions. You approve each one before anything goes live. Full control."
+                : "AI generates → auto-approves → publishes live with random timing and daily limits. No manual action needed."}
+            </p>
+          </div>
+          {isAdmin && (
+            <div className="mt-4 rounded-2xl border border-border bg-background/70 p-4">
+              <div className="flex flex-wrap gap-2">
+                {(["manual", "auto"] as const).map((m) => (
+                  <button
+                    key={m}
+                    type="button"
+                    disabled={updatePublishMode.isPending}
+                    onClick={() => updatePublishMode.mutate(m)}
+                    className={`rounded-2xl px-4 py-2 text-sm transition-colors capitalize ${
+                      publishModeActive === m ? "bg-primary text-primary-foreground" : "border border-border hover:bg-accent"
+                    }`}
+                  >
+                    {m === "manual" ? "Manual" : "Auto"}
+                  </button>
+                ))}
+              </div>
+              <p className="mt-2 text-xs text-muted-foreground">Same as the Dashboard toggle. Changes take effect immediately.</p>
+            </div>
+          )}
         </div>
 
         <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
@@ -740,6 +801,114 @@ export function Settings() {
             )
           })}
         </div>
+
+        {/* Human-like timing — expanded card with editable delay ranges */}
+        {(() => {
+          const simEnabled = (configMap.get("human_sim_enabled")?.value ?? "false") === "true"
+          const pipMin = configMap.get("pipeline_delay_min_minutes")?.value ?? "5"
+          const pipMax = configMap.get("pipeline_delay_max_minutes")?.value ?? "20"
+          const pubMin = configMap.get("publish_delay_min_minutes")?.value ?? "45"
+          const pubMax = configMap.get("publish_delay_max_minutes")?.value ?? "180"
+          return (
+            <div className="panel p-5">
+              <div className="flex items-start justify-between gap-4">
+                <div className="flex gap-3">
+                  <div className="flex h-11 w-11 items-center justify-center rounded-2xl bg-primary/10 text-primary">
+                    <Settings2 className="h-5 w-5" />
+                  </div>
+                  <div>
+                    <h3 className="text-lg font-semibold">Human-like timing</h3>
+                    <p className="text-sm text-muted-foreground">Random delays before pipeline and publish steps to mimic natural human behavior. Avoids bot-like patterns.</p>
+                  </div>
+                </div>
+                {isAdmin && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setEditingTiming(!editingTiming)
+                      setTimingDraft({ human_sim_enabled: simEnabled ? "true" : "false", pipeline_delay_min_minutes: pipMin, pipeline_delay_max_minutes: pipMax, publish_delay_min_minutes: pubMin, publish_delay_max_minutes: pubMax })
+                    }}
+                    className="rounded-xl border border-border p-2 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                  >
+                    <PencilLine className="h-4 w-4" />
+                  </button>
+                )}
+              </div>
+              <div className="mt-4 rounded-2xl bg-muted/60 p-4">
+                <div className="text-xs uppercase tracking-[0.16em] text-muted-foreground">Current value</div>
+                <div className="mt-2 text-lg font-semibold">{simEnabled ? "Enabled (realistic delays)" : "Disabled (instant)"}</div>
+                <div className="mt-3 grid grid-cols-2 gap-3 text-sm text-muted-foreground">
+                  <div>
+                    <span className="font-medium text-foreground">Pipeline delay</span>
+                    <div>{pipMin}–{pipMax} min (random)</div>
+                  </div>
+                  <div>
+                    <span className="font-medium text-foreground">Publish delay</span>
+                    <div>{pubMin}–{Math.round(Number(pubMax) / 60 * 10) / 10} hr (random)</div>
+                  </div>
+                </div>
+                <p className="mt-2 text-xs text-muted-foreground">Turn off during testing to skip all delays.</p>
+              </div>
+              {editingTiming && isAdmin && (
+                <div className="mt-4 rounded-2xl border border-border bg-background/70 p-4 space-y-4">
+                  <div>
+                    <div className="mb-2 text-sm font-medium">Enable/disable</div>
+                    <div className="flex flex-wrap gap-2">
+                      {[{ v: "true", label: "Enabled (realistic delays)" }, { v: "false", label: "Disabled (instant)" }].map(({ v, label }) => (
+                        <button key={v} type="button"
+                          onClick={() => setTimingDraft((d) => ({ ...d, human_sim_enabled: v }))}
+                          className={`rounded-2xl px-4 py-2 text-sm transition-colors ${timingDraft.human_sim_enabled === v ? "bg-primary text-primary-foreground" : "border border-border hover:bg-accent"}`}
+                        >{label}</button>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <div className="mb-1.5 text-sm font-medium">Pipeline delay min (min)</div>
+                      <input type="number" min="1" max="60" value={timingDraft.pipeline_delay_min_minutes}
+                        onChange={(e) => setTimingDraft((d) => ({ ...d, pipeline_delay_min_minutes: e.target.value }))}
+                        className="w-full rounded-xl border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring" />
+                      <div className="mt-1 text-xs text-muted-foreground">Default: 5</div>
+                    </div>
+                    <div>
+                      <div className="mb-1.5 text-sm font-medium">Pipeline delay max (min)</div>
+                      <input type="number" min="1" max="60" value={timingDraft.pipeline_delay_max_minutes}
+                        onChange={(e) => setTimingDraft((d) => ({ ...d, pipeline_delay_max_minutes: e.target.value }))}
+                        className="w-full rounded-xl border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring" />
+                      <div className="mt-1 text-xs text-muted-foreground">Default: 20</div>
+                    </div>
+                    <div>
+                      <div className="mb-1.5 text-sm font-medium">Publish delay min (min)</div>
+                      <input type="number" min="1" max="240" value={timingDraft.publish_delay_min_minutes}
+                        onChange={(e) => setTimingDraft((d) => ({ ...d, publish_delay_min_minutes: e.target.value }))}
+                        className="w-full rounded-xl border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring" />
+                      <div className="mt-1 text-xs text-muted-foreground">Default: 45</div>
+                    </div>
+                    <div>
+                      <div className="mb-1.5 text-sm font-medium">Publish delay max (min)</div>
+                      <input type="number" min="1" max="240" value={timingDraft.publish_delay_max_minutes}
+                        onChange={(e) => setTimingDraft((d) => ({ ...d, publish_delay_max_minutes: e.target.value }))}
+                        className="w-full rounded-xl border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring" />
+                      <div className="mt-1 text-xs text-muted-foreground">Default: 180 (3 hrs)</div>
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    <button type="button" disabled={saveTimingSettings.isPending}
+                      onClick={() => saveTimingSettings.mutate(timingDraft)}
+                      className="inline-flex items-center gap-2 rounded-2xl bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-50"
+                    >
+                      {saveTimingSettings.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+                      Save
+                    </button>
+                    <button type="button" onClick={() => setEditingTiming(false)}
+                      className="rounded-2xl border border-border px-4 py-2 text-sm transition-colors hover:bg-accent"
+                    >Cancel</button>
+                  </div>
+                </div>
+              )}
+            </div>
+          )
+        })()}
       </section>
     </div>
   )

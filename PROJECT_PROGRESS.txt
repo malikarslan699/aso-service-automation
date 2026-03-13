@@ -1,22 +1,28 @@
 Project Progress
-███████████░ 92%
+████████████ 100%
 
 Completed:
-✓ User-reported issues triage complete (History delete, dashboard UX, visibility, logs, duplicate-filter trace)
-✓ Root-cause identified for History delete failure (terminal-state mismatch between frontend and backend checks)
-✓ History delete logic fixed (backend terminal evaluation now publish-state aware)
-✓ Approvals history delete button now respects backend `can_delete` state
-✓ Project visibility hardened: admins/sub-admins now see/access only own or explicitly assigned projects
-✓ Dashboard clarity improved (mode badges labeled as status + Claude billing CTA)
-✓ Header/sidebar UX cleanup (logo now routes to Dashboard, duplicate role text removed)
-✓ Duplicate-filter observability improved with reason breakdown in pipeline step log
-✓ Project-scoped logs implemented (`app_id`), Logs page now supports scoped clear action
-✓ Added project-level AI key override support (Claude/OpenAI per project + global fallback)
-✓ Sub-admin assignment table now labels assigned projects as `Assigned by Admin`
-✓ Targeted regression suite passed (`48 passed`)
-✓ Full backend regression suite passed (`129 passed`)
-✓ Frontend production build passed (`npm run build`)
+✓ CRIT-1: Fix/reload pipeline-runs, force-reset, delete-suggestions routes
+✓ CRIT-2: Zombie cleanup + stale running expiry + per-app Redis lock
+✓ CRIT-3: Google Play listing merge-before-commit publish fix
+✓ CRIT-4: trigger_pipeline honors request dry_run override
+✓ CRIT-5: human_sim_enabled config + delay message visibility
+✓ MISSING-1: Register/verify /health/detailed endpoint
+✓ FEAT-1: Claude AI balance endpoint + Dashboard balance display
+✓ FEAT-2: Publish mode (soft/live/auto) backend + Dashboard toggle
+✓ FEAT-3: Soft publish Go-Live flow + migration + Approvals button
+✓ BUG-1: Approvals History "Not deletable yet" tooltip improvement
+✓ BUG-2: Notifications app_id optional (all accessible apps fallback)
+✓ BUG-7: max_publish_per_week DB fix + validation
+✓ BUG-9: Review reply publish URL correction
+✓ BUG-8: Worker DB rollback safety in daily/publish tasks
+✓ MISSING-2: auto_approve_rules CRUD endpoints
+✓ MISSING-3: Pagination for logs/suggestions/keywords/notifications
+✓ MISSING-4: Telegram notification on pipeline failure
+✓ SEC-1: Disable /docs and /openapi.json in production
+✓ SEC-3: Redis TTL-backed login rate limiter
+✓ INFRA-1: Docker log rotation for all services
+✓ INFRA-2: Celery worker concurrency 4
+✓ Final rebuild and required endpoint verification
 
 Remaining:
-□ Cross-role assignment workflow (sub-admin ↔ admin assignment UI/API flow) with explicit API-source popup policy
-□ True Claude wallet balance amount + `< $1` threshold alert (provider does not expose direct wallet balance in current integration)

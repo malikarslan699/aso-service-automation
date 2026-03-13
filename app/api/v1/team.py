@@ -3,9 +3,9 @@ from pydantic import BaseModel
 from sqlalchemy import select, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth.security import hash_password
+from app.auth.security import hash_password, verify_password
 from app.database import get_db
-from app.dependencies import require_role
+from app.dependencies import get_current_user, require_role
 from app.models.app import App
 from app.models.user import User
 from app.models.user_app_access import UserAppAccess
@@ -230,3 +230,24 @@ async def delete_sub_admin(
     target = await _get_sub_admin_or_404(db, user_id)
     await db.delete(target)
     await db.commit()
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
+
+
+@router.patch("/me/password")
+async def change_own_password(
+    body: ChangePasswordRequest,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Allow any logged-in user (admin or sub_admin) to change their own password."""
+    if not verify_password(body.current_password, user.hashed_password):
+        raise HTTPException(status_code=400, detail="Current password is incorrect.")
+    if len(body.new_password) < 8:
+        raise HTTPException(status_code=400, detail="New password must be at least 8 characters.")
+    user.hashed_password = hash_password(body.new_password)
+    await db.commit()
+    return {"status": "ok", "message": "Password changed successfully."}

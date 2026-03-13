@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 import pytest_asyncio
 from httpx import AsyncClient, ASGITransport
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.main import app
 from app.database import get_db
@@ -129,6 +130,37 @@ class TestListSuggestions:
         assert len(last_data["items"]) == 5
         assert last_data["has_more"] is False
         assert last_data["next_offset"] is None
+
+    async def test_list_suggestions_page_and_limit(self, client, auth_headers, test_app):
+        from tests.conftest import test_session
+
+        async with test_session() as session:
+            for idx in range(3):
+                session.add(
+                    Suggestion(
+                        app_id=test_app["id"],
+                        suggestion_type="listing",
+                        field_name="title",
+                        old_value=f"Old {idx}",
+                        new_value=f"New {idx}",
+                        reasoning="Page query test",
+                        risk_score=0,
+                        status="pending",
+                        safety_result="{}",
+                    )
+                )
+            await session.commit()
+
+        resp = await client.get(
+            f"/api/v1/apps/{test_app['id']}/suggestions?page=2&limit=2",
+            headers=auth_headers,
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["page"] == 2
+        assert data["limit"] == 2
+        assert data["total"] == 3
+        assert len(data["items"]) == 1
 
     async def test_list_suggestions_filter_by_status(self, client, auth_headers, test_suggestion):
         resp = await client.get(
@@ -484,8 +516,103 @@ class TestTriggerPipeline:
             assert "Queue timeout" in (old_run.error_message or "")
             assert new_run.status == "queued"
 
+    async def test_trigger_pipeline_respects_request_dry_run_override(self, client, auth_headers, test_app, monkeypatch):
+        from tests.conftest import test_session
+        from app.workers.celery_app import celery_app
+
+        captured: dict = {}
+
+        def _fake_send_task(*args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            return DummyTask("task-dry-override")
+
+        monkeypatch.setattr(celery_app, "send_task", _fake_send_task)
+
+        async with test_session() as session:
+            dry_run_row = (
+                await session.execute(select(GlobalConfig).where(GlobalConfig.key == "dry_run"))
+            ).scalar_one_or_none()
+            if dry_run_row is None:
+                session.add(GlobalConfig(key="dry_run", value="false", description="test"))
+            else:
+                dry_run_row.value = "false"
+
+            cooldown_row = (
+                await session.execute(select(GlobalConfig).where(GlobalConfig.key == "manual_trigger_cooldown_minutes"))
+            ).scalar_one_or_none()
+            if cooldown_row is None:
+                session.add(GlobalConfig(key="manual_trigger_cooldown_minutes", value="0", description="test"))
+            else:
+                cooldown_row.value = "0"
+            await session.commit()
+
+        resp = await client.post(
+            f"/api/v1/apps/{test_app['id']}/pipeline/trigger",
+            headers=auth_headers,
+            json={"dry_run": True},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "queued"
+        assert data["dry_run"] is True
+        assert captured["kwargs"]["kwargs"]["dry_run_override"] is True
+
 
 class TestPipelineRunCleanup:
+    async def test_go_live_commits_soft_published_suggestion(self, client, auth_headers, test_app, monkeypatch):
+        from tests.conftest import test_session
+        from app.models.app_credential import AppCredential
+        from app.utils.encryption import encrypt_value
+
+        monkeypatch.setattr(
+            "app.services.data_fetcher.commit_listing_edit",
+            lambda **kwargs: {
+                "success": True,
+                "status": "published",
+                "message": "Draft edit committed to Google Play.",
+            },
+        )
+
+        async with test_session() as session:
+            session.add(
+                AppCredential(
+                    app_id=test_app["id"],
+                    credential_type="service_account_json",
+                    value=encrypt_value("{}"),
+                )
+            )
+            suggestion = Suggestion(
+                app_id=test_app["id"],
+                suggestion_type="listing",
+                field_name="long_description",
+                old_value="Old",
+                new_value="New",
+                reasoning="soft publish test",
+                risk_score=1,
+                status="approved",
+                publish_status="soft_published",
+                google_play_edit_id="edit-soft-1",
+                safety_result="{}",
+            )
+            session.add(suggestion)
+            await session.commit()
+            suggestion_id = suggestion.id
+
+        resp = await client.post(
+            f"/api/v1/apps/{test_app['id']}/suggestions/{suggestion_id}/go-live",
+            headers=auth_headers,
+        )
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "published"
+
+        async with test_session() as session:
+            updated = await session.get(Suggestion, suggestion_id)
+            assert updated is not None
+            assert updated.publish_status == "published"
+            assert updated.status == "published"
+            assert updated.google_play_edit_id is None
+
     async def test_pipeline_run_can_delete_when_publish_failed(self, client, auth_headers, test_app):
         from tests.conftest import test_session
 

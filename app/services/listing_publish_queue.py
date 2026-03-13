@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 LISTING_FIELDS = {"title", "short_description", "long_description"}
 OPEN_JOB_STATUSES = {"queued_bundle", "waiting_safe_window", "publishing"}
-FINAL_JOB_STATUSES = {"published", "dry_run_only", "blocked", "failed", "superseded"}
+FINAL_JOB_STATUSES = {"published", "soft_published", "dry_run_only", "blocked", "failed", "superseded"}
 
 
 def _serialize_ids(values: Iterable[int]) -> str:
@@ -226,6 +226,7 @@ def _set_superseded(suggestion: Suggestion, *, now: datetime, message: str, job_
     suggestion.last_transition_at = now
     suggestion.publish_completed_at = now
     suggestion.merged_into_job_id = job_id
+    suggestion.google_play_edit_id = None
 
     _status_log_update(
         suggestion,
@@ -260,6 +261,7 @@ def _set_waiting_state(
     suggestion.dispatch_window = dispatch_window
     suggestion.published_live = False
     suggestion.is_dry_run_result = False
+    suggestion.google_play_edit_id = None
 
     _status_log_update(
         suggestion,
@@ -295,6 +297,7 @@ def _set_blocked_state(
     suggestion.publish_completed_at = now
     suggestion.last_transition_at = now
     suggestion.next_eligible_at = None
+    suggestion.google_play_edit_id = None
     if job_id is not None:
         suggestion.merged_into_job_id = job_id
 
@@ -316,6 +319,7 @@ def _set_publishing_state(suggestion: Suggestion, *, now: datetime, job_id: int)
     suggestion.publish_completed_at = None
     suggestion.last_transition_at = now
     suggestion.merged_into_job_id = job_id
+    suggestion.google_play_edit_id = None
 
     _status_log_update(
         suggestion,
@@ -332,19 +336,21 @@ def _set_result_state(
     *,
     now: datetime,
     job_id: int,
-    dry_run: bool,
+    publish_status: str,
     message: str,
+    edit_id: str | None = None,
 ) -> None:
-    suggestion.publish_status = "dry_run_only" if dry_run else "published"
+    suggestion.publish_status = publish_status
     suggestion.publish_message = message
     suggestion.publish_block_reason = None
     suggestion.publish_completed_at = now
     suggestion.last_transition_at = now
     suggestion.merged_into_job_id = job_id
     suggestion.next_eligible_at = None
-    suggestion.published_live = not dry_run
-    suggestion.is_dry_run_result = dry_run
-    if dry_run:
+    suggestion.google_play_edit_id = edit_id if publish_status == "soft_published" else None
+    suggestion.published_live = publish_status == "published"
+    suggestion.is_dry_run_result = publish_status == "dry_run_only"
+    if publish_status in {"dry_run_only", "soft_published"}:
         suggestion.status = "approved"
         suggestion.published_at = None
     else:
@@ -377,6 +383,7 @@ def _set_failed_state(suggestion: Suggestion, *, now: datetime, reason: str, job
     suggestion.publish_completed_at = now
     suggestion.last_transition_at = now
     suggestion.merged_into_job_id = job_id
+    suggestion.google_play_edit_id = None
 
     _status_log_update(
         suggestion,
@@ -847,12 +854,21 @@ def dispatch_listing_bundle_job(db, job_id: int) -> dict:
 
     completed_at = utcnow_naive()
     if result.get("success"):
-        job.status = "dry_run_only" if result.get("dry_run") else "published"
+        if result.get("dry_run"):
+            final_publish_status = "dry_run_only"
+        elif result.get("status") == "soft_published":
+            final_publish_status = "soft_published"
+        else:
+            final_publish_status = "published"
+
+        job.status = final_publish_status
         job.executed_at = completed_at
         job.blocked_reason = None
         message = (
             f"Dry run listing bundle #{job.id} simulated successfully."
-            if result.get("dry_run")
+            if final_publish_status == "dry_run_only"
+            else f"Listing bundle #{job.id} saved as draft edit."
+            if final_publish_status == "soft_published"
             else f"Listing bundle #{job.id} published on Google Play."
         )
         for suggestion in final_items:
@@ -860,8 +876,9 @@ def dispatch_listing_bundle_job(db, job_id: int) -> dict:
                 suggestion,
                 now=completed_at,
                 job_id=job.id,
-                dry_run=bool(result.get("dry_run")),
+                publish_status=final_publish_status,
                 message=message,
+                edit_id=result.get("edit_id"),
             )
 
         db.commit()

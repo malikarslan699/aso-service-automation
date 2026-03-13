@@ -15,6 +15,7 @@ celery_app = Celery(
         "app.workers.tasks.dispatch_listing_bundle_job",
         "app.workers.tasks.refresh_policies",
         "app.workers.tasks.track_performance",
+        "app.workers.tasks.retry_publish_window",
     ],
 )
 
@@ -37,6 +38,11 @@ celery_app.conf.update(
         "refresh-policies-weekly": {
             "task": "refresh_policies",
             "schedule": crontab(day_of_week=1, hour=2, minute=0),
+        },
+        # Hourly: re-queue pending_window suggestions if inside publish window (9AM-10PM UTC)
+        "retry-publish-window-hourly": {
+            "task": "retry_publish_window",
+            "schedule": crontab(minute=5),  # :05 past every hour
         },
     },
 )

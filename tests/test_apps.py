@@ -179,6 +179,7 @@ async def test_sub_admin_can_create_own_app_and_see_it(client: AsyncClient, auth
 
 @pytest.mark.asyncio
 async def test_admin_sees_only_own_projects(client: AsyncClient, auth_headers):
+    """Admin role should only see their own apps (multi-tenant: no cross-user visibility)."""
     from tests.conftest import test_session
     from app.models.user import User
     from app.auth.security import hash_password
@@ -206,9 +207,10 @@ async def test_admin_sees_only_own_projects(client: AsyncClient, auth_headers):
     assert second_login.status_code == 200
     second_headers = {"Authorization": f"Bearer {second_login.json()['access_token']}"}
 
+    # Second admin should NOT see first admin's app (multi-tenant isolation)
     second_list_before = await client.get("/api/v1/apps", headers=second_headers)
     assert second_list_before.status_code == 200
-    assert all(app["package_name"] != "com.admin.one.app" for app in second_list_before.json())
+    assert not any(app["package_name"] == "com.admin.one.app" for app in second_list_before.json())
 
     second_create = await client.post(
         "/api/v1/apps",
@@ -217,6 +219,7 @@ async def test_admin_sees_only_own_projects(client: AsyncClient, auth_headers):
     )
     assert second_create.status_code == 201
 
+    # First admin should NOT see app created by second admin
     first_list_after = await client.get("/api/v1/apps", headers=auth_headers)
     assert first_list_after.status_code == 200
-    assert all(app["package_name"] != "com.admin.two.app" for app in first_list_after.json())
+    assert not any(app["package_name"] == "com.admin.two.app" for app in first_list_after.json())

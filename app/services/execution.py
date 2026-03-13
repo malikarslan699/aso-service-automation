@@ -6,6 +6,14 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
+def _is_true(val, default: bool = False) -> bool:
+    if val is None:
+        return default
+    if isinstance(val, bool):
+        return val
+    return str(val).strip().lower() in {"true", "1", "yes"}
+
+
 def _count_suggestion_publishes(app_id: int, db, *, since: datetime, suggestion_type: str) -> int:
     from sqlalchemy import func, select
 
@@ -103,6 +111,12 @@ def publish(
     """Publish an approved suggestion to Google Play."""
     from app.models.app_listing import AppListing
     from app.services import data_fetcher
+    from app.services.runtime_config import as_int, load_runtime_config
+
+    config = load_runtime_config(db)
+    publish_mode = (config.get("publish_mode") or "live").strip().lower()
+    if publish_mode not in {"soft", "live"}:
+        publish_mode = "live"
 
     if credential_json is None and not dry_run:
         logger.warning(f"Missing Google Play credential for app {app.id} while live publish was requested")
@@ -124,6 +138,31 @@ def publish(
         dry_run = True
         logger.warning(f"No credential for app {app.id} - forcing dry_run mode")
 
+    # --- Human sim: publish window + random delay ---
+    human_sim_enabled = _is_true(config.get("human_sim_enabled"), False)
+    if not dry_run and human_sim_enabled and publish_mode != "soft":
+        from app.services import human_simulator
+        if not human_simulator.is_publish_window():
+            app_name = getattr(app, "name", str(app.id))
+            suggestion.publish_status = "pending_window"
+            suggestion.publish_message = "Outside safe publish window (9AM–10PM UTC). Will publish in next window."
+            suggestion.last_transition_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            db.commit()
+            from app.services import notifier
+            notifier.send_publish_blocked(app_name, "Outside publish window (9AM–10PM UTC). Queued for next window.", db)
+            return {
+                "success": False,
+                "dry_run": False,
+                "status": "pending_window",
+                "message": suggestion.publish_message,
+            }
+        pub_min = as_int(config.get("publish_delay_min_minutes"), 45)
+        pub_max = as_int(config.get("publish_delay_max_minutes"), 180)
+        delay_s = human_simulator.compute_publish_delay_seconds(dry_run=dry_run, enabled=human_sim_enabled, min_minutes=pub_min, max_minutes=pub_max)
+        if delay_s > 0:
+            logger.info("Human sim: publish delay %s minutes for app %s", delay_s // 60, app.id)
+            human_simulator.publish_delay_sync(dry_run=dry_run, enabled=human_sim_enabled, delay_seconds=delay_s)
+
     current = data_fetcher.fetch_listing(app.package_name)
     before_snapshot = AppListing(
         app_id=app.id,
@@ -137,6 +176,7 @@ def publish(
 
     field = suggestion.field_name
     result = {}
+    suggestion.google_play_edit_id = None
 
     if suggestion.suggestion_type == "review_reply":
         extra = {}
@@ -158,6 +198,7 @@ def publish(
             "package_name": app.package_name,
             "credential_json": credential_json or "",
             "dry_run": dry_run,
+            "commit_edit": publish_mode != "soft",
         }
         if field == "title":
             kwargs["title"] = suggestion.new_value
@@ -180,10 +221,19 @@ def publish(
             suggestion.publish_status = "dry_run_only"
             suggestion.status = "approved"
             suggestion.published_at = None
+            suggestion.google_play_edit_id = None
+        elif result.get("status") == "soft_published":
+            suggestion.publish_status = "soft_published"
+            suggestion.status = "approved"
+            suggestion.published_at = None
+            suggestion.published_live = False
+            suggestion.is_dry_run_result = False
+            suggestion.google_play_edit_id = result.get("edit_id")
         else:
             suggestion.publish_status = "published"
             suggestion.status = "published"
             suggestion.published_at = completed_at
+            suggestion.google_play_edit_id = None
 
         after_listing = data_fetcher.fetch_listing(app.package_name)
         after_snapshot = AppListing(
@@ -197,6 +247,16 @@ def publish(
 
         db.commit()
         logger.info(f"Published suggestion {suggestion.id} for app {app.id} (dry_run={dry_run})")
+
+        # Telegram notifications
+        from app.services import notifier
+        app_name = getattr(app, "name", str(app.id))
+        if result.get("dry_run"):
+            pass  # dry run — no notification needed
+        elif result.get("status") == "soft_published":
+            notifier.send_soft_publish_notification(suggestion, app_name, db)
+        else:
+            notifier.send_publish_confirmation(suggestion, app_name, dry_run=False, db=db)
     else:
         completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
         publish_status = "blocked" if result.get("status") == "blocked" else "failed"
@@ -207,6 +267,10 @@ def publish(
         suggestion.publish_block_reason = suggestion.publish_message
         logger.error(f"Publish failed for suggestion {suggestion.id}: {result.get('message')}")
         db.commit()
+
+        from app.services import notifier
+        app_name = getattr(app, "name", str(app.id))
+        notifier.send_publish_blocked(app_name, result.get("message", "Publish failed"), db)
 
     return result
 
@@ -224,6 +288,7 @@ def publish_listing_bundle(
     """Publish merged listing fields in one Google Play edit."""
     from app.models.app_listing import AppListing
     from app.services import data_fetcher
+    from app.services.runtime_config import load_runtime_config
 
     if not title and not short_description and not long_description:
         return {
@@ -258,6 +323,11 @@ def publish_listing_bundle(
     db.add(before_snapshot)
     db.flush()
 
+    config = load_runtime_config(db)
+    publish_mode = (config.get("publish_mode") or "live").strip().lower()
+    if publish_mode not in {"soft", "live"}:
+        publish_mode = "live"
+
     result = data_fetcher.publish_listing(
         package_name=app.package_name,
         credential_json=credential_json or "",
@@ -265,6 +335,7 @@ def publish_listing_bundle(
         short_description=short_description,
         long_description=long_description,
         dry_run=dry_run,
+        commit_edit=publish_mode != "soft",
     )
 
     if result.get("success"):

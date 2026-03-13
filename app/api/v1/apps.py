@@ -32,18 +32,16 @@ async def list_apps(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    query = select(App).order_by(App.created_at.desc())
-    if user.role in {"admin", "sub_admin"}:
-        query = (
-            select(App)
-            .outerjoin(
-                UserAppAccess,
-                (UserAppAccess.app_id == App.id) & (UserAppAccess.user_id == user.id),
-            )
-            .where(or_(App.owner_user_id == user.id, UserAppAccess.user_id == user.id))
-            .order_by(App.created_at.desc())
-            .distinct()
+    query = (
+        select(App)
+        .outerjoin(
+            UserAppAccess,
+            (UserAppAccess.app_id == App.id) & (UserAppAccess.user_id == user.id),
         )
+        .where(or_(App.owner_user_id == user.id, UserAppAccess.user_id == user.id))
+        .order_by(App.created_at.desc())
+        .distinct()
+    )
     result = await db.execute(query)
     return result.scalars().all()
 

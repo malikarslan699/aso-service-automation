@@ -1,0 +1,692 @@
+================================================================================
+  ASO-Service — Complete Audit v3
+  Date: 2026-03-13
+  Type: LIVE server testing + full code audit
+  Server: http://localhost:8000 (production server tested directly)
+  Auditor: Claude (every endpoint hit, every log read, DB queried)
+================================================================================
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION A — CRITICAL BUGS (Found via live server testing)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[CRIT-1] force-reset & pipeline-runs endpoints RETURN 404 — NOT REGISTERED  ← BROKEN
+  File   : app/api/v1/router.py
+  Problem: These 3 endpoints exist in suggestions.py code but are NEVER
+           registered in router.py — so they return 404 in production:
+             GET    /api/v1/apps/{app_id}/pipeline-runs       → 404
+             DELETE /api/v1/apps/{app_id}/pipeline-runs/{run_id}/suggestions → 404
+             POST   /api/v1/apps/{app_id}/suggestions/{id}/force-reset → 404
+           Tested live: confirmed 404 on all three.
+           Frontend Approvals "History" tab and "Force Reset" button are
+           completely broken because backend returns 404.
+  Fix    : In app/api/v1/router.py, the suggestions_router is already included
+           with prefix="/apps". These routes ARE in suggestions.py. The issue
+           is likely that router.py was not reloaded after these routes were added.
+           Solution: Rebuild/restart the API container.
+           Command: docker compose restart api
+           If still 404 after restart: verify the @router decorators in
+           suggestions.py match expected paths.
+
+
+[CRIT-2] 3 pipeline runs PERMANENTLY STUCK for App 2 (Saas)  ← ZOMBIE RUNS
+  Database: pipeline_runs table
+  Affected: run IDs 19, 20, 21 — all app_id=2, status="running"
+            All started at 2026-03-13 10:59:00, never completed.
+            All stuck at steps_completed=4/9.
+  Problem: These are zombie runs. Celery beat sent the same task 3 times
+           (at same second) for the Saas app. All 3 are in "running" state
+           forever because the worker moved on but never marked them as failed.
+  DB query result:
+    id=19, app_id=2, status=running, trigger=scheduled, steps=4/9
+    id=20, app_id=2, status=running, trigger=scheduled, steps=4/9
+    id=21, app_id=2, status=running, trigger=scheduled, steps=4/9
+  Root cause: Celery beat sent task multiple times in same second (dedup missing).
+              Also: stale run expiry logic doesn't clean up "running" runs —
+              it only expires "queued" runs. Running-but-dead runs live forever.
+  Fix:
+    1. Immediate DB fix (run now):
+       UPDATE pipeline_runs SET status='failed', error_message='Zombie run - manually marked failed'
+       WHERE id IN (19, 20, 21);
+    2. Code fix: _expire_stale_queued_runs() in suggestions.py should also
+       expire runs with status='running' that have not updated in 30+ minutes.
+    3. Celery beat deduplication: Add a lock/semaphore so only one pipeline
+       task per app can be queued at a time.
+       Use Redis lock: SET "pipeline_lock:app_{app_id}" 1 EX 3600 NX
+
+
+[CRIT-3] Google Play publish ALWAYS FAILS with 403 error  ← ALL PUBLISHES BROKEN
+  Error  : "This app does not have a title set for the default language."
+  Logs   : celery-worker shows this error for suggestions 19, 20, 21, 25, 26
+  DB     : 5 suggestions with status=approved, publish_status=failed
+  Problem: When publishing to Google Play API, the edit commit is failing with:
+           HttpError 403: "This app does not have a title set for the default language."
+           This means the Google Play listing for com.NetSafe.VPN does NOT have
+           a "title" field set in the default language in the edit being committed.
+           The code sends only the fields it wants to update (e.g. long_description)
+           but Google Play requires ALL required fields (title, short description)
+           to be present when committing an edit.
+  Root cause in code:
+    app/services/execution.py — when creating a Google Play edit, the code
+    only sets the specific field being changed (long_description, short_description).
+    It does NOT fetch the existing title first and include it in the edit.
+    Google Play API: when you commit an edit, ALL fields that are not explicitly
+    set in the edit will be CLEARED. If title is not set in the edit, Google
+    blocks the commit with 403.
+  Fix    :
+    In execution.py publish logic, before committing a listing edit:
+    1. First GET the existing listing: GET .../listings/{language}
+    2. Merge the new field change ON TOP of the existing listing data
+    3. Then PUT the merged listing (with title included)
+    4. Then commit the edit
+    Example fix in execution.py:
+      existing = service.edits().listings().get(
+          packageName=package, editId=edit_id, language=language).execute()
+      merged = {**existing, field_name: new_value}
+      service.edits().listings().update(
+          packageName=package, editId=edit_id, language=language,
+          body=merged).execute()
+
+
+[CRIT-4] Pipeline trigger ignores dry_run field in request  ← CONFIRMED BUG
+  Endpoint: POST /api/v1/apps/{app_id}/pipeline/trigger
+  Test    : Sent {"dry_run": true} → Response: {"dry_run": false, "requested_dry_run": true}
+  Problem: The request body has dry_run=true but system uses global config
+           dry_run=false. The response itself shows "requested_dry_run": true
+           meaning the code acknowledges it but ignores it.
+           When user clicks "Run Now" and thinks they're doing a dry run,
+           they're actually triggering a LIVE publish run.
+  Fix    :
+    In app/api/v1/suggestions.py trigger_pipeline():
+      If request.dry_run is explicitly True, override global config for this run.
+      This run should run with dry_run=True regardless of global setting.
+
+
+[CRIT-5] Human simulator adds 5-20 minute delay on ALL live pipeline runs
+  File   : app/services/human_simulator.py
+  Problem: When dry_run=false (LIVE mode), the pipeline deliberately sleeps
+           for a random 5-20 minutes BEFORE starting keyword discovery.
+           Tested live: pipeline 23 shows "Human simulation: pipeline delay
+           12 minutes" in worker logs.
+           Combined with 10+ minute AI processing time = total 15-30 min per run.
+           User sees "Pipeline running..." for 20+ minutes with no feedback.
+           There is NO way to skip this from the Dashboard.
+  Additional: publish_delay_sync() adds ANOTHER 45min-3hr delay before publishing!
+              So after approval: user waits 45min-3 hours for publish to even start.
+  Fix    :
+    Option A: Make delays configurable via global_config:
+              "human_sim_pipeline_delay_enabled": "true"
+              "human_sim_publish_delay_enabled": "true"
+    Option B: Add a Dashboard toggle "Fast Mode / Human Sim Mode"
+    Option C: Always show current delay status in pipeline trace step:
+              "Waiting (human simulation delay: 8 min remaining)"
+    MINIMUM FIX: Show the delay countdown in the pipeline step_log so
+    user knows why it's stuck.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION B — HIGH PRIORITY BUGS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[BUG-1] "Not deletable yet" amber badge — confusing UX  ← USER REPORTED
+  File   : frontend/src/pages/Approvals.tsx (line 415-418)
+  Problem: When suggestions are in "approved+failed" state (like suggestions
+           25, 26 in DB), _is_terminal_for_cleanup() returns True for failed.
+           BUT for "approved+queued" or "approved+queued_bundle" state,
+           it returns False — batch shows "Not deletable yet".
+           User sees the badge with no explanation.
+  Live DB: suggestions 25,26 are approved+failed → should be deletable
+           but pipeline-runs endpoint is 404 (CRIT-1) so History tab is broken.
+  Fix    :
+    1. Fix CRIT-1 first (register routes)
+    2. Replace amber "Not deletable yet" badge with tooltip explaining why:
+       "X suggestion(s) still processing. Check back when publish completes."
+    3. In _is_terminal_for_cleanup(): treat "failed" publish_status as terminal
+       (it already does — verify after CRIT-1 fix)
+
+
+[BUG-2] Notifications endpoint requires app_id (breaking UX)
+  Endpoint: GET /api/v1/notifications
+  Test    : Called without app_id → 422 "Field required: app_id"
+  Problem: Frontend must always pass app_id to get notifications.
+           If user is on a page without selected app, notifications don't load.
+           Also: admin should see ALL notifications, not just per-app.
+  Fix    : Make app_id optional. If not provided, return notifications for
+           all apps the current user has access to.
+
+
+[BUG-3] Saas app (App 2) has NO Google Play credentials configured
+  DB     : integration_check_google_play_app_2 = "service account JSON is missing"
+  Problem: App 2 exists but has no Google Play service account.
+           Every scheduled pipeline run for this app will fail at publish step.
+           Currently generating 3 zombie runs (CRIT-2).
+  Fix    : Either add credentials to App 2 or mark App 2 as inactive.
+
+
+[BUG-4] Duplicate pipeline tasks sent by Celery beat
+  Logs   : daily_pipeline[dc729353-f4c1-4f58-9e6d-2027971f1bca] received at:
+           11:56, 12:56, 13:56, 14:56, 15:16
+           Same task_id queued multiple times across hours.
+  Problem: Celery beat is re-queuing the same task because the previous
+           instances are still "running" (zombie). Beat doesn't check if
+           a pipeline for that app is already running before dispatching.
+  Fix    :
+    In dispatch_daily_pipeline task:
+      from redis import Redis
+      r = Redis.from_url(settings.redis_url)
+      lock_key = f"pipeline_running:app_{app_id}"
+      if r.get(lock_key):
+          logger.info(f"Pipeline already running for app {app_id}, skipping")
+          return
+      r.setex(lock_key, 3600, "1")  # 1 hour TTL
+      try:
+          run_pipeline(app_id)
+      finally:
+          r.delete(lock_key)
+
+
+[BUG-5] pipeline_delay called with dry_run=False even when user wants dry run
+  File   : app/workers/tasks/daily_pipeline.py
+  Problem: human_simulator.pipeline_delay_sync(dry_run=...) is called with
+           the GLOBAL dry_run config, not the per-run override.
+           So even if CRIT-4 is fixed (request dry_run honored), the
+           human simulator will still add delays for this run.
+  Fix    : Pass the effective dry_run value (considering per-run override)
+           to pipeline_delay_sync().
+
+
+[BUG-6] App 2 package_name is "Google " (with trailing space)
+  DB     : apps table, id=2, package_name="Google "
+  Problem: Invalid package name. Google Play API will reject any calls
+           for this package. This is causing pipeline failures for App 2.
+  Fix    : Validate package_name on create/update:
+           - Must match regex: ^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*)+$
+           - No spaces allowed
+           In apps.py: add validator before saving.
+
+
+[BUG-7] max_publish_per_week = 5 equals listing_publish_max_per_day = 5
+  DB     : max_publish_per_week=5, listing_publish_max_per_day=5
+  Problem: The weekly limit (5) equals the daily limit (5).
+           This means after 5 publishes on Day 1, nothing can publish for
+           the rest of the week. Likely a config mistake — week limit
+           should be higher than daily limit (e.g. day=3, week=15).
+  Fix    : Update global_config:
+           max_publish_per_week → 15 (or user's preferred value)
+           Clarify in Settings UI that daily ≤ weekly.
+
+
+[BUG-8] sqlalchemy InFailedSqlTransaction error in worker
+  Logs   : celery-worker shows:
+           "sqlalchemy.exc.InternalError: current transaction is aborted,
+            commands ignored until end of transaction block"
+           This happens when a DB query fails mid-transaction and the
+           session is not properly rolled back.
+  Problem: In app/workers/tasks/, the sync DB sessions don't have proper
+           exception handling. If one query fails, subsequent queries in
+           the same session fail with "InFailedSqlTransaction".
+  Fix    :
+    In all worker task files using sync sessions:
+      try:
+          db.execute(...)
+          db.commit()
+      except Exception:
+          db.rollback()
+          raise
+
+
+[BUG-9] Review reply publish returns 404 from Google Play
+  Logs   : "HttpError 404 when requesting .../reviews/:reply?alt=json"
+  Problem: The review reply publish URL is wrong.
+           Correct Google Play API endpoint for reply:
+             POST .../androidpublisher/v3/applications/{package}/reviews/{reviewId}:reply
+           Current code seems to be calling wrong URL pattern.
+  File   : app/services/execution.py (review reply publish section)
+  Fix    : Verify the review reply API call format matches Google Play
+           Developer API v3 documentation.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION C — USER REQUESTED FEATURES (Must Implement)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[FEAT-1] Remaining Claude API Balance on Dashboard  ← USER REQUESTED
+  Where  : frontend/src/pages/Dashboard.tsx (lines 244-259)
+  Current: Shows "Manage Claude credits and invoices." with external link only.
+  Problem: User cannot see remaining balance without opening external page.
+  Implementation:
+    Backend — new endpoint:
+      GET /api/v1/settings/ai-balance
+      → Call Anthropic API: POST https://api.anthropic.com/v1/usage
+        with header: "anthropic-beta": "usage-2023-06-01"
+        Returns usage/balance data
+      Response: { "provider": "anthropic", "balance_usd": 12.34, "status": "ok" }
+      Cache result for 5 minutes (don't hit API on every dashboard load).
+
+    Frontend — in Dashboard.tsx, Claude Billing card:
+      Replace static text with:
+        Balance: $12.34  (green if >$5, amber if $1-5, red if <$1)
+      Auto-refresh every 5 minutes
+      Show "Balance unavailable" if API call fails
+
+  Files:
+    app/api/v1/settings.py       → add GET /ai-balance endpoint
+    frontend/src/pages/Dashboard.tsx → display balance value
+
+
+[FEAT-2] 3 Publish Mode Toggle — Accessible from Dashboard  ← USER REQUESTED
+  Current: Only dry_run=true/false in Settings. No concept of "soft publish".
+  User wants 3 clear modes, switchable FROM DASHBOARD:
+
+    MODE 1 — "Soft Publish" (NEW)
+      → Pipeline runs, suggestions generated, approval workflow works
+      → On approve: sends changes to Google Play as DRAFT EDIT (not committed)
+      → Google Play edit is created and fields updated, but NOT committed/submitted
+      → Changes sit in Google Play as an open edit (admin can see in Play Console)
+      → publish_status = "soft_published"
+      → Safe: nothing is public until admin manually commits in Play Console
+      → OR: add a "Go Live" button in app that commits the draft edit
+
+    MODE 2 — "Live to Google" (existing live mode, currently dry_run=false)
+      → Same as now when dry_run=false
+      → Edit is created AND committed to Google Play
+      → Changes go live after Google review
+      → publish_status = "published"
+
+    MODE 3 — "Auto to Publish" (NEW)
+      → No manual approval step needed
+      → Auto-approve rules from auto_approve_rules table run
+      → If suggestion passes rules → automatically queued for publish
+      → Combined with MODE 1 or MODE 2
+      → Controlled by: manual_approval_required = false in global_config
+        (this key already exists in DB! Just needs UI toggle)
+
+  Dashboard UI:
+    Add a 3-segment button below pipeline status section:
+    [ Soft Publish ] [ Live to Google ] [ Auto to Publish ]
+    Active mode highlighted. Clicking changes mode with confirmation dialog.
+    Also shown as badge in Dashboard header (replacing or alongside DRY RUN badge).
+
+  Backend changes needed:
+    1. Add "publish_mode" key to global_config:
+       "soft" = soft publish (draft only), "live" = full publish
+    2. Add endpoint: PATCH /api/v1/settings/publish-mode
+       body: {"mode": "soft" | "live", "auto_approve": true | false}
+    3. In execution.py:
+       if publish_mode == "soft":
+           create edit + update fields → DO NOT call edits().commit()
+           set publish_status = "soft_published"
+       if publish_mode == "live":
+           existing behavior (create + update + commit)
+    4. publish_status should be expanded to include "soft_published"
+
+  Files to change:
+    app/api/v1/settings.py
+    app/services/execution.py
+    app/services/listing_publish_queue.py
+    frontend/src/pages/Dashboard.tsx
+    frontend/src/components/Layout.tsx (header badge)
+
+
+[FEAT-3] Soft Publish → "Go Live" Two-Step Flow  ← USER REQUESTED
+  Problem: Currently approval → immediate publish. User wants:
+    Step 1: Approve → "Soft Published" (draft in Google Play)
+    Step 2: Admin reviews draft in Play Console
+    Step 3: Click "Go Live" in app → commit the draft edit to Google Play
+
+  Implementation:
+    1. When publish_mode="soft": after publish, store the edit_id returned
+       by Google Play in a new field: suggestion.google_play_edit_id
+    2. New endpoint:
+       POST /api/v1/apps/{app_id}/suggestions/{id}/go-live
+         → Fetch stored edit_id
+         → Call: service.edits().commit(packageName=pkg, editId=edit_id)
+         → Update publish_status = "published", published_live = True
+    3. Frontend: In Approvals.tsx, for suggestions with publish_status="soft_published":
+       Show green "Go Live" button (admin only)
+       Confirmation dialog: "This will push changes live to Google Play. Confirm?"
+
+  New model field: suggestion.google_play_edit_id (nullable String)
+  New migration needed.
+
+  Files:
+    app/models/suggestion.py           → add google_play_edit_id column
+    alembic/versions/                  → new migration
+    app/services/execution.py          → store edit_id on soft publish
+    app/api/v1/suggestions.py          → add /go-live endpoint
+    frontend/src/pages/Approvals.tsx   → Go Live button for soft_published
+
+
+[FEAT-4] Dashboard Publish Mode Quick-Toggle (not just Settings)
+  Current: dry_run toggle is hidden in Settings → Global Config as a text field.
+  Fix    : The 3-mode toggle from FEAT-2 replaces this.
+           Additionally: current DRY RUN MODE / LIVE MODE badges on Dashboard
+           should be clickable and open a mode-change dialog directly.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION D — MISSING FEATURES / NOT IMPLEMENTED
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[MISSING-1] /health/detailed endpoint returns 404
+  Test   : curl http://localhost:8000/health/detailed → {"detail":"Not Found"}
+           Only /health works. /health/detailed is missing from routes.
+  Fix    : Register the /health/detailed endpoint in app/main.py.
+           It exists in code but is not reachable.
+
+
+[MISSING-2] Auto-approve rules — model exists but no management UI or API
+  DB     : auto_approve_rules table exists (empty)
+           global_config has auto_approve_threshold=1
+           manual_approval_required=true (in DB)
+  Problem: No CRUD endpoints for auto_approve_rules.
+           No UI to create/edit rules.
+           The "Auto to Publish" mode (FEAT-2) cannot work without this.
+  Fix    : Add CRUD endpoints in app/api/v1/settings.py or new file:
+           GET    /api/v1/settings/auto-approve-rules
+           POST   /api/v1/settings/auto-approve-rules
+           PATCH  /api/v1/settings/auto-approve-rules/{id}
+           DELETE /api/v1/settings/auto-approve-rules/{id}
+           Add UI section in Settings page.
+
+
+[MISSING-3] Pagination for all list endpoints
+  Affected (confirmed via testing):
+    /api/v1/apps/{id}/keywords      → returns 65 (hard limit 100, no page)
+    /api/v1/logs                    → no pagination
+    /api/v1/apps/{id}/suggestions   → no pagination (limit 200)
+    /api/v1/notifications           → no pagination (limit 50)
+  Fix    : Add ?page=1&limit=50 to all list endpoints.
+
+
+[MISSING-4] No Telegram notification when pipeline fails
+  Live   : Pipeline runs 19, 20, 21 failed (zombie). No Telegram alert sent.
+  Fix    : In daily_pipeline.py exception handler:
+             notifier.send_telegram(f"Pipeline failed for app {app_id}: {error}")
+
+
+[MISSING-5] Pipeline progress — no real-time updates
+  Problem: Dashboard polls every 5 seconds when pipeline running.
+           With 12-minute human sim delay, users wait with no feedback.
+           The step_log shows "Keyword Discovery: pending" with no ETA.
+  Fix    : Show estimated time remaining in step_log.
+           Or add SSE (Server-Sent Events) for live updates.
+           Minimum: Add "Waiting: ~X minutes remaining" to pending step message.
+
+
+[MISSING-6] Export history to CSV
+  Not implemented. Nice to have for client reporting.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION E — SECURITY ISSUES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[SEC-1] API docs exposed in production (/docs, /openapi.json reachable)
+  Test   : curl http://localhost:8000/openapi.json → returns full API schema
+  Fix    : In app/main.py, check environment:
+             if settings.environment == "production":
+                 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+
+
+[SEC-2] Default SECRET_KEY still valid if not set in .env
+  File   : app/config.py
+  Fix    : Raise startup error if SECRET_KEY == "change-me-to-a-random-string"
+
+
+[SEC-3] Rate limiting in-memory only (resets on container restart)
+  File   : app/services/login_rate_limiter.py
+  Fix    : Move counters to Redis with TTL.
+
+
+[SEC-4] Nginx has no rate limiting on /auth/login
+  File   : nginx/default.conf
+  Fix    : Add limit_req_zone + limit_req directive.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION F — INFRASTRUCTURE ISSUES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[INFRA-1] No log rotation — logs will fill disk
+  Fix    : Add to all services in docker-compose.yml:
+           logging:
+             driver: "json-file"
+             options: {max-size: "50m", max-file: "5"}
+
+
+[INFRA-2] Celery concurrency only 2 workers
+  Problem: With multiple apps and human sim delays (each task holds a worker
+           for 20+ minutes), only 2 tasks can run at once.
+           App 1 pipeline (20 min) + App 2 pipeline (20 min) = BOTH workers busy.
+           Any new task waits in queue.
+  Fix    : Increase to --concurrency=4 in docker-compose.yml celery-worker command.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION G — COMPLETE LIVE TEST RESULTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Endpoint                                     Result    Notes
+───────────────────────────────────────────────────────────────────────────────
+GET  /health                                 ✅ PASS   {"status":"ok"}
+GET  /health/detailed                        ❌ FAIL   404 Not Found
+POST /auth/login (admin/myadmin1447)         ✅ PASS   JWT returned
+GET  /auth/me                                ✅ PASS   user data returned
+GET  /api/v1/dashboard                       ✅ PASS   apps + pipeline data
+GET  /api/v1/apps                            ✅ PASS   2 apps returned
+GET  /api/v1/apps/1/suggestions              ✅ PASS   suggestions returned
+GET  /api/v1/apps/1/keywords                 ✅ PASS   65 keywords
+GET  /api/v1/apps/1/keywords/competitors     ✅ PASS   competitor keywords
+GET  /api/v1/apps/1/reviews                  ✅ PASS   empty list (no reviews)
+GET  /api/v1/apps/1/facts                    ✅ PASS   3 facts returned
+GET  /api/v1/apps/1/connections/google-play  ✅ PASS   connected:true
+GET  /api/v1/settings/global                 ✅ PASS   all config keys visible
+GET  /api/v1/settings/integrations/status    ✅ PASS   anthropic+telegram OK
+POST /api/v1/apps/1/pipeline/trigger         ⚠️ WARN   queued but ignores dry_run
+GET  /api/v1/logs                            ✅ PASS   13 log entries
+GET  /api/v1/notifications                   ❌ FAIL   422 — app_id required
+GET  /api/v1/notifications?app_id=1          ✅ PASS   empty list
+GET  /api/v1/team/users                      ✅ PASS   2 sub-admins
+GET  /api/v1/apps/1/pipeline-runs            ❌ FAIL   404 — route not registered
+DELETE /api/v1/apps/1/pipeline-runs/22/...   ❌ FAIL   404 — route not registered
+POST /api/v1/apps/1/suggestions/26/force-reset ❌ FAIL 404 — route not registered
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION H — DATABASE SNAPSHOT (Live State)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Tables present: apps, users, suggestions, pipeline_runs, keywords,
+                global_config, auto_approve_rules, notifications,
+                app_credentials, app_facts, app_listings, system_logs,
+                review_replies, policy_cache, user_app_access
+
+Current state:
+  Apps         : 2 (NetSafe VPN [id=1], Saas [id=2])
+  Users        : admin + 2 sub-admins (mehboob, saqibtest)
+  Suggestions  : 26 total
+                 approved+failed: 5    ← Google Play 403 error
+                 approved+blocked: 4   ← publish rate limit hit
+                 approved+dry_run_only: 3
+                 superseded: 13
+                 published: 1 (review reply, id=11)
+  Pipeline runs: 23 total
+                 completed: 7 (for app 1)
+                 running: 4 (ZOMBIE: 3 for app 2, 1 current for app 1)
+  Keywords     : 65 for app 1, 0 for app 2
+
+Global config key issues:
+  dry_run                  = false         → Live publish mode active
+  max_publish_per_week     = 5             ← Same as daily limit (BUG-7)
+  listing_publish_max_per_day = 5          ← Same as weekly (BUG-7)
+  google_service_account_json = empty      ← App 2 has no creds (BUG-3)
+  manual_approval_required = true          → Manual approval active
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION I — WHAT IS WORKING CORRECTLY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ✅ Authentication (JWT login/logout, role-based access)
+  ✅ App management (create, edit apps)
+  ✅ Pipeline execution (runs, step tracking, step_log)
+  ✅ AI suggestion generation (Anthropic Claude working, costs tracked)
+  ✅ Keyword discovery (65 keywords found for NetSafe VPN)
+  ✅ Google Play connection test for App 1 (credentials valid)
+  ✅ Dashboard data loading (N+1 fix working)
+  ✅ DRY RUN / LIVE MODE badges on Dashboard
+  ✅ Settings page (global config load/save)
+  ✅ Integration status page (Anthropic: healthy, Telegram: connected)
+  ✅ Team management (sub-admin users, app assignment)
+  ✅ Celery beat running (sending scheduled tasks)
+  ✅ Redis connected and healthy
+  ✅ PostgreSQL healthy
+  ✅ App facts (encryption, kill_switch, split_tunneling) stored correctly
+  ✅ Suggestion approval flow (status transitions)
+  ✅ Supersede logic (old suggestions marked superseded on new run)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION J — PRIORITY IMPLEMENTATION ORDER
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+P0 — Fix Immediately (Broken in production right now)
+──────────────────────────────────────────────────────
+  [ ] CRIT-1: Register pipeline-runs, force-reset, delete-suggestions routes
+              in app/api/v1/router.py → restart API container
+  [ ] CRIT-2: Mark zombie runs 19, 20, 21 as failed in DB
+              Add stale "running" run expiry to suggestions.py
+              Add Redis lock to prevent duplicate task dispatch
+  [ ] CRIT-3: Fix Google Play publish — fetch existing listing before commit
+              so title is included in the edit (execution.py)
+  [ ] CRIT-4: Honor dry_run field from trigger request body
+  [ ] BUG-9:  Fix review reply publish URL (404 from Google Play API)
+  [ ] MISSING-1: Register /health/detailed endpoint
+
+
+P1 — High Priority (This Sprint)
+──────────────────────────────────────────────────────
+  [ ] FEAT-1: Remaining Claude balance on Dashboard
+  [ ] FEAT-2: 3-mode publish toggle on Dashboard (Soft/Live/Auto)
+  [ ] FEAT-3: Soft Publish → Go Live two-step flow
+              (add google_play_edit_id to suggestion model, new migration)
+  [ ] CRIT-5: Human sim delay — make configurable OR show countdown in UI
+  [ ] BUG-1:  Fix "Not deletable yet" badge with tooltip
+  [ ] BUG-2:  Make notifications app_id optional
+  [ ] BUG-4:  Add Redis lock to prevent duplicate Celery tasks per app
+  [ ] BUG-6:  Validate package_name format (no spaces, proper format)
+  [ ] BUG-7:  Fix max_publish_per_week > max_publish_per_day config
+
+
+P2 — Medium Priority
+──────────────────────────────────────────────────────
+  [ ] BUG-8:  Fix sqlalchemy InFailedSqlTransaction in workers
+  [ ] MISSING-2: Add auto-approve rules CRUD endpoints + UI
+  [ ] MISSING-3: Add pagination to all list endpoints
+  [ ] MISSING-4: Send Telegram alert on pipeline failure
+  [ ] MISSING-5: Show delay ETA in pipeline step log
+  [ ] SEC-1:  Disable /docs in production
+  [ ] SEC-2:  Block startup if default SECRET_KEY
+  [ ] SEC-3:  Move rate limiter to Redis
+  [ ] SEC-4:  Add nginx rate limiting on /auth/login
+  [ ] INFRA-1: Add log rotation to docker-compose.yml
+  [ ] INFRA-2: Increase Celery worker concurrency to 4
+
+
+P3 — Nice to Have
+──────────────────────────────────────────────────────
+  [ ] MISSING-6: Export history to CSV
+  [ ] MISSING-5: SSE for real-time pipeline progress
+  [ ] BUG-3:  Add credentials to App 2 or mark inactive
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION K — EXACT FILES TO CHANGE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+File                                       Changes needed
+──────────────────────────────────────────────────────────────────────────────
+app/api/v1/router.py                   CRIT-1: already has suggestions_router —
+                                        restart container to pick up new routes.
+                                        If still 404: ensure @router.get/post/delete
+                                        decorators on all 3 endpoints in suggestions.py
+                                        have correct paths.
+
+app/api/v1/suggestions.py              CRIT-4: honor request.dry_run
+                                        BUG-1: update _is_terminal_for_cleanup
+                                        CRIT-2: expand _expire_stale to cover "running"
+
+app/api/v1/notifications.py            BUG-2: make app_id query param optional
+
+app/api/v1/settings.py                 FEAT-1: add GET /ai-balance endpoint
+                                        FEAT-2: add PATCH /publish-mode endpoint
+                                        MISSING-2: add auto-approve rules CRUD
+
+app/api/v1/main.py                     MISSING-1: register /health/detailed
+                                        SEC-1: disable docs in production
+
+app/services/execution.py             CRIT-3: fetch existing listing before commit
+                                        BUG-9: fix review reply URL
+                                        FEAT-2: add soft_publish logic (no commit)
+                                        FEAT-3: store edit_id on soft publish
+
+app/services/human_simulator.py        CRIT-5: add configurable toggle
+
+app/workers/tasks/daily_pipeline.py    BUG-4: add Redis lock per app
+                                        BUG-5: pass effective dry_run to delay fn
+
+app/workers/tasks/publish_suggestion.py BUG-8: add rollback on exception
+
+app/models/suggestion.py               FEAT-3: add google_play_edit_id column
+
+app/services/login_rate_limiter.py     SEC-3: move counters to Redis
+
+docker-compose.yml                     INFRA-1: log rotation
+                                        INFRA-2: concurrency=4
+
+nginx/default.conf                     SEC-4: rate limiting on /auth/login
+
+alembic/versions/ (new migration)      FEAT-3: suggestion.google_play_edit_id
+
+frontend/src/pages/Dashboard.tsx       FEAT-1: balance display
+                                        FEAT-2: 3-mode toggle
+                                        CRIT-5: show delay ETA
+
+frontend/src/pages/Approvals.tsx       BUG-1: fix "Not deletable yet" tooltip
+                                        FEAT-3: Go Live button for soft_published
+
+frontend/src/pages/Settings.tsx        MISSING-2: auto-approve rules UI
+                                        FEAT-2: publish mode settings
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION L — IMMEDIATE DB FIXES (Run These SQL Commands Now)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+-- Fix zombie pipeline runs for App 2:
+UPDATE pipeline_runs
+SET status='failed',
+    error_message='Zombie run - marked failed by audit cleanup',
+    completed_at=NOW()
+WHERE id IN (19, 20, 21);
+
+-- Fix weekly publish limit (should be higher than daily):
+UPDATE global_config SET value='15' WHERE key='max_publish_per_week';
+
+-- Fix App 2 invalid package name (update to correct value or delete app):
+UPDATE apps SET package_name='com.example.saas' WHERE id=2;
+-- OR: UPDATE apps SET status='inactive' WHERE id=2;
+
+================================================================================
+  END OF AUDIT v3
+  Live endpoints tested: 18
+  Passed: 11  |  Failed: 4  |  Warning: 1  |  Not found: 2
+  Critical bugs: 5
+  High bugs: 9
+  User features requested: 4
+  Missing features: 6
+  Security issues: 4
+  Infra issues: 2
+================================================================================

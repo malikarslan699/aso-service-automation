@@ -2,7 +2,7 @@ import { useMemo, useState } from "react"
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query"
 import api from "@/lib/api"
 import { useAuth } from "@/hooks/useAuth"
-import { CheckCircle, XCircle, ChevronDown, ChevronUp, CircleDot, Clock3, ShieldAlert, Sparkles, Trash2, RotateCcw, History } from "lucide-react"
+import { CheckCircle, XCircle, ChevronDown, ChevronUp, CircleDot, Clock3, ShieldAlert, Sparkles, Trash2, RotateCcw, History, Bell, BellOff } from "lucide-react"
 import { getPublishBadge, getPublishCounterKey, getReviewBadge } from "@/lib/publishState"
 import { fetchAllSuggestions } from "@/lib/suggestions"
 
@@ -71,6 +71,16 @@ export function Approvals() {
     enabled: !!selectedApp,
   })
 
+  const { data: telegramStatus } = useQuery({
+    queryKey: ["telegram-status", selectedApp?.id],
+    queryFn: () =>
+      api.post("/api/v1/settings/integrations/check", { provider: "telegram", app_id: selectedApp?.id })
+        .then((r) => ({ connected: r.data?.results?.[0]?.connected ?? false }))
+        .catch(() => ({ connected: false })),
+    enabled: !!selectedApp,
+    staleTime: 60_000,
+  })
+
   const { data: pipelineRunsData, isLoading: runsLoading } = useQuery({
     queryKey: ["pipeline-runs", selectedApp?.id],
     queryFn: () =>
@@ -99,6 +109,12 @@ export function Approvals() {
   const forceReset = useMutation({
     mutationFn: (id: number) =>
       api.post(`/api/v1/apps/${selectedApp?.id}/suggestions/${id}/force-reset`),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["suggestions"] }),
+  })
+
+  const goLive = useMutation({
+    mutationFn: (id: number) =>
+      api.post(`/api/v1/apps/${selectedApp?.id}/suggestions/${id}/go-live`),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["suggestions"] }),
   })
 
@@ -173,6 +189,7 @@ export function Approvals() {
     const canReview = s.review_status === "pending" && (user?.role === "admin" || user?.role === "sub_admin")
     const canRetry = user?.role === "admin" && ["blocked", "failed", "superseded", "dry_run_only"].includes(s.publish_status || "")
     const canForceReset = user?.role === "admin" && s.review_status !== "pending"
+    const canGoLive = user?.role === "admin" && s.publish_status === "soft_published"
 
     return (
       <div key={s.id} className="rounded-lg border border-border bg-card p-4 space-y-3">
@@ -323,6 +340,20 @@ export function Approvals() {
           </div>
         )}
 
+        {canGoLive && (
+          <div className="pt-1">
+            <button
+              onClick={() => goLive.mutate(s.id)}
+              disabled={goLive.isPending}
+              className="inline-flex items-center gap-1.5 rounded-md border border-emerald-300 px-3 py-1.5 text-xs font-medium text-emerald-700 hover:bg-emerald-50 disabled:opacity-50"
+              title="Commit this draft edit to make it live on Google Play"
+            >
+              <CheckCircle className="h-3.5 w-3.5" />
+              Go Live
+            </button>
+          </div>
+        )}
+
         {canForceReset && (
           <div className="pt-1">
             <button
@@ -353,7 +384,7 @@ export function Approvals() {
       ["ready", "queued", "queued_bundle", "publishing", "waiting_safe_window"].includes(item.publish_status || "ready")
     )
     const outcomeItems = batch.suggestions.filter((item: any) =>
-      ["published", "dry_run_only", "blocked", "failed"].includes(item.publish_status)
+      ["published", "soft_published", "dry_run_only", "blocked", "failed"].includes(item.publish_status)
     )
     const rejectedItems = batch.suggestions.filter((item: any) => item.review_status === "rejected")
     const supersededItems = batch.suggestions.filter((item: any) => item.review_status === "superseded")
@@ -413,7 +444,10 @@ export function Approvals() {
               )
             )}
             {showDelete && batch.runId && user?.role === "admin" && !canDelete && (
-              <span className="inline-flex items-center rounded-full border border-amber-200 px-2.5 py-1 text-[11px] font-medium text-amber-700 bg-amber-50">
+              <span
+                className="inline-flex items-center rounded-full border border-amber-200 px-2.5 py-1 text-[11px] font-medium text-amber-700 bg-amber-50 cursor-help"
+                title="Cannot delete: suggestions still being published."
+              >
                 Not deletable yet
               </span>
             )}
@@ -446,12 +480,27 @@ export function Approvals() {
 
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-bold">Approvals</h1>
-        <p className="text-muted-foreground text-sm mt-1">
-          {totalPending} suggestion{totalPending !== 1 ? "s" : ""} pending review
-          {batches.length > 0 && ` · ${batches.length} batch${batches.length !== 1 ? "es" : ""} total`}
-        </p>
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h1 className="text-2xl font-bold">Approvals</h1>
+          <p className="text-muted-foreground text-sm mt-1">
+            {totalPending} suggestion{totalPending !== 1 ? "s" : ""} pending review
+            {batches.length > 0 && ` · ${batches.length} batch${batches.length !== 1 ? "es" : ""} total`}
+          </p>
+        </div>
+        {telegramStatus !== undefined && (
+          telegramStatus?.connected ? (
+            <span className="inline-flex items-center gap-1.5 rounded-full border border-green-200 bg-green-50 px-3 py-1.5 text-xs font-medium text-green-700">
+              <Bell className="h-3.5 w-3.5" />
+              Telegram alerts active
+            </span>
+          ) : (
+            <span className="inline-flex items-center gap-1.5 rounded-full border border-amber-200 bg-amber-50 px-3 py-1.5 text-xs font-medium text-amber-700" title="Configure Telegram in Settings → Integrations">
+              <BellOff className="h-3.5 w-3.5" />
+              Telegram not configured
+            </span>
+          )
+        )}
       </div>
 
       {/* Tabs */}

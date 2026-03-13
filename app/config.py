@@ -8,6 +8,7 @@ DEFAULT_SECRET_KEY = "change-me-to-a-random-string"
 class Settings(BaseSettings):
     # Core
     secret_key: str = DEFAULT_SECRET_KEY
+    environment: str = "development"
     database_url: str = "postgresql+asyncpg://aso_user:aso_pass@postgres:5432/aso_db"
     database_url_sync: str = "postgresql://aso_user:aso_pass@postgres:5432/aso_db"
     redis_url: str = "redis://redis:6379/0"

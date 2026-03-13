@@ -156,7 +156,7 @@ def hydrate_status_log(suggestion) -> list[dict[str, Any]]:
             occurred_at=getattr(suggestion, "last_transition_at", None) or getattr(suggestion, "updated_at", None),
         )
 
-    if publish_status in {"ready", "queued", "queued_bundle", "publishing", "waiting_safe_window", "published", "dry_run_only", "blocked", "failed", "superseded"}:
+    if publish_status in {"ready", "queued", "queued_bundle", "publishing", "waiting_safe_window", "published", "soft_published", "dry_run_only", "blocked", "failed", "superseded"}:
         queue_status = "completed" if publish_status != "ready" else "pending"
         if publish_status == "superseded":
             queue_status = "blocked"
@@ -188,7 +188,7 @@ def hydrate_status_log(suggestion) -> list[dict[str, Any]]:
             actor="system",
             occurred_at=getattr(suggestion, "publish_completed_at", None) or getattr(suggestion, "last_transition_at", None),
         )
-    elif publish_status in {"published", "dry_run_only"}:
+    elif publish_status in {"published", "soft_published", "dry_run_only"}:
         update_status_stage(
             stages,
             "waiting_safe_window",
@@ -198,7 +198,7 @@ def hydrate_status_log(suggestion) -> list[dict[str, Any]]:
             occurred_at=getattr(suggestion, "publish_started_at", None) or getattr(suggestion, "last_transition_at", None),
         )
 
-    if publish_status in {"publishing", "published", "dry_run_only", "failed"}:
+    if publish_status in {"publishing", "published", "soft_published", "dry_run_only", "failed"}:
         attempt_status = "running" if publish_status == "publishing" else ("failed" if publish_status == "failed" else "completed")
         update_status_stage(
             stages,
@@ -209,10 +209,10 @@ def hydrate_status_log(suggestion) -> list[dict[str, Any]]:
             occurred_at=getattr(suggestion, "publish_started_at", None) or getattr(suggestion, "last_transition_at", None),
         )
 
-    if publish_status in {"published", "dry_run_only", "blocked", "failed", "superseded"}:
+    if publish_status in {"published", "soft_published", "dry_run_only", "blocked", "failed", "superseded"}:
         final_status = (
             "completed"
-            if publish_status in {"published", "dry_run_only"}
+            if publish_status in {"published", "soft_published", "dry_run_only"}
             else ("blocked" if publish_status in {"blocked", "superseded"} else "failed")
         )
         update_status_stage(

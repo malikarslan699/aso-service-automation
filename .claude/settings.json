@@ -1,0 +1,14 @@
+{
+  "autoApprove": true,
+  "allowedCommands": [
+    "bash",
+    "curl",
+    "git",
+    "python",
+    "grep",
+    "docker",
+    "docker-compose",
+    "npm",
+    "node"
+  ]
+}

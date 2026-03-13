@@ -26,7 +26,21 @@ def publish_suggestion_task(suggestion_id: int, app_id: int):
     engine = create_engine(settings.database_url_sync)
 
     with Session(engine) as db:
-        suggestion = db.execute(
+        def _safe_execute(statement):
+            try:
+                return db.execute(statement)
+            except Exception:
+                db.rollback()
+                raise
+
+        def _safe_commit() -> None:
+            try:
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
+
+        suggestion = _safe_execute(
             select(Suggestion)
             .where(Suggestion.id == suggestion_id)
             .where(Suggestion.app_id == app_id)
@@ -52,7 +66,7 @@ def publish_suggestion_task(suggestion_id: int, app_id: int):
                 "job_id": result.get("job_id"),
             }
 
-        app = db.execute(select(App).where(App.id == app_id)).scalar_one_or_none()
+        app = _safe_execute(select(App).where(App.id == app_id)).scalar_one_or_none()
         if app is None:
             return {"status": "skipped", "reason": "app not found"}
 
@@ -79,7 +93,7 @@ def publish_suggestion_task(suggestion_id: int, app_id: int):
             occurred_at=publish_started_at,
         )
         apply_status_log(suggestion, status_log)
-        db.commit()
+        _safe_commit()
 
         allowed, reason = execution.can_publish(app_id, db, publish_kind="review_reply")
         if not allowed:
@@ -108,10 +122,10 @@ def publish_suggestion_task(suggestion_id: int, app_id: int):
             )
             apply_status_log(suggestion, status_log)
             db.add(SystemLog(level="warning", module="publish_suggestion", message=reason, app_id=app_id))
-            db.commit()
+            _safe_commit()
             return {"status": "blocked", "reason": reason}
 
-        cred_row = db.execute(
+        cred_row = _safe_execute(
             select(AppCredential)
             .where(AppCredential.app_id == app_id)
             .where(AppCredential.credential_type == "service_account_json")
@@ -151,7 +165,7 @@ def publish_suggestion_task(suggestion_id: int, app_id: int):
             )
             apply_status_log(suggestion, status_log)
             db.add(SystemLog(level="warning", module="publish_suggestion", message=reason, app_id=app_id))
-            db.commit()
+            _safe_commit()
             return {"status": "blocked", "reason": reason}
 
         similar_live_reason = recent_live_publish_block_reason(suggestion, db) if not dry_run else None
@@ -181,7 +195,7 @@ def publish_suggestion_task(suggestion_id: int, app_id: int):
             )
             apply_status_log(suggestion, status_log)
             db.add(SystemLog(level="warning", module="publish_suggestion", message=similar_live_reason, app_id=app_id))
-            db.commit()
+            _safe_commit()
             return {"status": "blocked", "reason": similar_live_reason}
 
         result = execution.publish(
@@ -248,7 +262,7 @@ def publish_suggestion_task(suggestion_id: int, app_id: int):
                 occurred_at=completed_at,
             )
         apply_status_log(suggestion, status_log)
-        db.commit()
+        _safe_commit()
 
         db.add(
             SystemLog(
@@ -258,6 +272,6 @@ def publish_suggestion_task(suggestion_id: int, app_id: int):
                 app_id=app_id,
             )
         )
-        db.commit()
+        _safe_commit()
         logger.info("publish_suggestion task finished for suggestion %s: %s", suggestion_id, result)
         return result

@@ -20,8 +20,11 @@ import {
   SunMedium,
   Menu,
   X,
+  Lock,
 } from "lucide-react"
 import { useState } from "react"
+import { useMutation } from "@tanstack/react-query"
+import api from "@/lib/api"
 
 const navItems = [
   { to: "/", label: "Dashboard", icon: LayoutDashboard },
@@ -41,6 +44,24 @@ export function Layout() {
   const { user, logout, backendConnected, authConnected } = useAuth()
   const { theme, toggleTheme } = useTheme()
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
+  const [showPwForm, setShowPwForm] = useState(false)
+  const [pwCurrent, setPwCurrent] = useState("")
+  const [pwNew, setPwNew] = useState("")
+  const [pwMsg, setPwMsg] = useState<{ ok: boolean; text: string } | null>(null)
+
+  const changePw = useMutation({
+    mutationFn: (data: { current_password: string; new_password: string }) =>
+      api.patch("/api/v1/team/me/password", data).then((r) => r.data),
+    onSuccess: () => {
+      setPwMsg({ ok: true, text: "Password changed successfully." })
+      setPwCurrent("")
+      setPwNew("")
+      setTimeout(() => { setShowPwForm(false); setPwMsg(null) }, 2000)
+    },
+    onError: (err: any) => {
+      setPwMsg({ ok: false, text: err?.response?.data?.detail ?? "Failed to change password." })
+    },
+  })
 
   const visibleItems = navItems.filter(
     (item) => !item.adminOnly || user?.role === "admin"
@@ -96,14 +117,61 @@ export function Layout() {
               <div className="text-xs text-muted-foreground">
                 <div className="font-medium text-foreground">{user?.username}</div>
               </div>
-              <button
-                onClick={toggleTheme}
-                className="rounded-xl border border-border p-2 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-                title={theme === "dark" ? "Switch to light theme" : "Switch to dark theme"}
-              >
-                {theme === "dark" ? <SunMedium className="h-4 w-4" /> : <MoonStar className="h-4 w-4" />}
-              </button>
+              <div className="flex items-center gap-1">
+                <button
+                  onClick={() => { setShowPwForm((v) => !v); setPwMsg(null) }}
+                  className="rounded-xl border border-border p-2 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                  title="Change password"
+                >
+                  <Lock className="h-4 w-4" />
+                </button>
+                <button
+                  onClick={toggleTheme}
+                  className="rounded-xl border border-border p-2 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                  title={theme === "dark" ? "Switch to light theme" : "Switch to dark theme"}
+                >
+                  {theme === "dark" ? <SunMedium className="h-4 w-4" /> : <MoonStar className="h-4 w-4" />}
+                </button>
+              </div>
             </div>
+
+            {showPwForm && (
+              <div className="mb-3 space-y-2 border-t border-border pt-3">
+                <input
+                  type="password"
+                  placeholder="Current password"
+                  value={pwCurrent}
+                  onChange={(e) => setPwCurrent(e.target.value)}
+                  className="w-full rounded-lg border border-border bg-background px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-primary"
+                />
+                <input
+                  type="password"
+                  placeholder="New password (min 8 chars)"
+                  value={pwNew}
+                  onChange={(e) => setPwNew(e.target.value)}
+                  className="w-full rounded-lg border border-border bg-background px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-primary"
+                />
+                {pwMsg && (
+                  <p className={`text-xs ${pwMsg.ok ? "text-green-600" : "text-red-600"}`}>{pwMsg.text}</p>
+                )}
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => changePw.mutate({ current_password: pwCurrent, new_password: pwNew })}
+                    disabled={changePw.isPending || !pwCurrent || !pwNew}
+                    className="flex-1 rounded-lg bg-primary px-2 py-1.5 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-50"
+                  >
+                    {changePw.isPending ? "Saving…" : "Save"}
+                  </button>
+                  <button
+                    onClick={() => { setShowPwForm(false); setPwMsg(null); setPwCurrent(""); setPwNew("") }}
+                    className="rounded-lg border border-border px-2 py-1.5 text-xs text-muted-foreground transition-colors hover:bg-accent"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            )}
+
             <div className="flex items-center justify-between">
               <div className="text-xs text-muted-foreground">
                 {backendConnected && authConnected ? (

@@ -12,6 +12,7 @@ import {
   Sparkles,
   ExternalLink,
   XCircle,
+  StopCircle,
 } from "lucide-react"
 
 import api from "@/lib/api"
@@ -35,6 +36,14 @@ type StepLogItem = {
   output_tokens?: number
 }
 
+type AiBalanceResponse = {
+  provider: string
+  status: string
+  balance_usd: number | null
+  message: string
+  cached?: boolean
+}
+
 function formatTriggerLabel(trigger?: string | null) {
   if (trigger === "manual") return "Manual run"
   if (trigger === "scheduled") return "Scheduled run"
@@ -50,6 +59,7 @@ export function Dashboard() {
   const qc = useQueryClient()
   const [feedback, setFeedback] = useState<ManualRunFeedback | null>(null)
   const canRunNow = user?.role === "admin" || user?.role === "sub_admin"
+  const canEditPublishMode = user?.role === "admin"
 
   const { data, isLoading, error } = useQuery({
     queryKey: ["dashboard", selectedApp?.id],
@@ -65,10 +75,9 @@ export function Dashboard() {
     mutationFn: () => api.post(`/api/v1/apps/${selectedApp?.id}/pipeline/trigger`).then((response) => response.data),
     onSuccess: (result) => {
       if (result.status === "queued") {
-        const modeText =
-          result.workflow_mode === "manual_approval"
-            ? "New suggestions will stop in Approvals."
-            : "Current auto rules will continue after generation."
+        const modeText = isManualApproval
+          ? "Suggestions will appear in Approvals for your review."
+          : "Auto mode: suggestions will be approved and queued automatically."
         setFeedback({ tone: "success", message: `${result.message} ${modeText}` })
       } else if (result.status === "blocked_running") {
         setFeedback({ tone: "warning", message: result.message })
@@ -91,9 +100,49 @@ export function Dashboard() {
     },
   })
 
+  const cancelPipeline = useMutation({
+    mutationFn: () => api.post(`/api/v1/apps/${selectedApp?.id}/pipeline/cancel`).then((r) => r.data),
+    onSuccess: () => {
+      setFeedback({ tone: "warning", message: "Pipeline cancelled." })
+      qc.invalidateQueries({ queryKey: ["dashboard"] })
+    },
+    onError: (mutationError: any) => {
+      const detail = mutationError?.response?.data?.detail
+      setFeedback({ tone: "error", message: typeof detail === "string" && detail ? detail : "Could not cancel pipeline." })
+    },
+  })
+
+  const updatePublishMode = useMutation({
+    mutationFn: (payload: { mode: "soft" | "live"; auto_approve: boolean }) =>
+      api.patch("/api/v1/settings/publish-mode", payload).then((response) => response.data),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["dashboard"] })
+    },
+    onError: (mutationError: any) => {
+      const detail = mutationError?.response?.data?.detail
+      setFeedback({
+        tone: "error",
+        message: typeof detail === "string" && detail ? detail : "Could not update publish mode.",
+      })
+    },
+  })
+
   useEffect(() => {
     setFeedback(null)
   }, [selectedApp?.id])
+
+  const { data: aiBalance, isFetching: aiBalanceLoading } = useQuery<AiBalanceResponse>({
+    queryKey: ["ai-balance", selectedApp?.id],
+    queryFn: () =>
+      api
+        .get("/api/v1/settings/ai-balance", {
+          params: selectedApp?.id ? { app_id: selectedApp.id } : undefined,
+        })
+        .then((response) => response.data),
+    enabled: true,
+    staleTime: 300000,
+    refetchInterval: 300000,
+  })
 
   const feedbackClass = useMemo(() => {
     if (!feedback) return ""
@@ -158,11 +207,39 @@ export function Dashboard() {
   const mode = data?.mode
   const isDryRun = mode?.dry_run !== false
   const isManualApproval = mode?.manual_approval_required !== false
+  const activePublishMode: "manual" | "auto" = isManualApproval ? "manual" : "auto"
+  const publishCounts = data?.publish_counts
+  const nextScheduledRun = data?.next_scheduled_run
+
+  const MODE_DESCRIPTIONS: Record<string, string> = {
+    manual: "AI generates suggestions — you approve each one before anything goes live. Full control.",
+    auto: "Fully automated — AI generates, auto-approves, and publishes live with random human-like timing.",
+  }
   const providerName = String(pipeline?.provider_name || "").toLowerCase()
   const providerStatus = String(pipeline?.provider_status || "").toLowerCase()
   const providerErrorClass = String(pipeline?.provider_error_class || "").toLowerCase()
   const showClaudeBilling = providerName.includes("anthropic")
   const needsBillingAttention = providerStatus.includes("billing") || providerErrorClass.includes("billing")
+  const balanceUsd = typeof aiBalance?.balance_usd === "number" ? aiBalance.balance_usd : null
+  const balanceBadgeClass =
+    balanceUsd === null
+      ? "text-muted-foreground"
+      : balanceUsd > 5
+        ? "text-green-700"
+        : balanceUsd >= 1
+          ? "text-amber-700"
+          : "text-red-700"
+  const showRechargeNow = balanceUsd !== null ? balanceUsd < 1 : needsBillingAttention
+
+  const setPublishMode = (target: "manual" | "auto") => {
+    if (!canEditPublishMode) return
+    if (target === activePublishMode || updatePublishMode.isPending) return
+    const payload =
+      target === "manual"
+        ? { mode: "live" as const, auto_approve: false }
+        : { mode: "live" as const, auto_approve: true }
+    updatePublishMode.mutate(payload)
+  }
 
   return (
     <div className="space-y-6">
@@ -180,10 +257,15 @@ export function Dashboard() {
             <span className={`h-1.5 w-1.5 rounded-full ${isDryRun ? "bg-amber-500" : "bg-green-500"}`} />
             {isDryRun ? "DRY RUN MODE" : "LIVE MODE"}
           </span>
-          <span className="inline-flex items-center gap-1.5 rounded-full border border-blue-200 bg-blue-50 px-3 py-1 text-xs font-medium text-blue-700">
-            {isManualApproval ? "Manual Approval" : "Auto Rules"}
+          <span
+            className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-medium ${
+              activePublishMode === "auto"
+                ? "border-indigo-300 bg-indigo-50 text-indigo-700"
+                : "border-blue-200 bg-blue-50 text-blue-700"
+            }`}
+          >
+            {activePublishMode === "auto" ? "Auto Publish" : "Manual Approval"}
           </span>
-          <span className="w-full text-[11px] text-muted-foreground">Mode status labels only (not buttons).</span>
         </div>
       </div>
 
@@ -207,10 +289,56 @@ export function Dashboard() {
                 {pipelineStatus === "queued" ? "Queued..." : isPipelineRunning ? "Running..." : "Run now"}
               </button>
             )}
+            {canRunNow && isPipelineRunning && (
+              <button
+                type="button"
+                onClick={() => cancelPipeline.mutate()}
+                disabled={cancelPipeline.isPending}
+                className="inline-flex items-center gap-2 rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-xs font-medium text-red-700 transition-colors hover:bg-red-100 disabled:opacity-50"
+                title="Cancel the running pipeline"
+              >
+                {cancelPipeline.isPending ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <StopCircle className="h-3.5 w-3.5" />}
+                Stop
+              </button>
+            )}
           </div>
 
           <div className={`text-lg font-semibold capitalize ${statusColor}`}>{formatStatus(pipelineStatus)}</div>
           <div className="mt-2 text-xs text-muted-foreground">{formatTriggerLabel(pipeline?.trigger)}</div>
+          <div className="mt-3 inline-flex w-full rounded-xl border border-border bg-muted/40 p-1">
+            {[
+              { key: "manual", label: "Manual" },
+              { key: "auto", label: "Auto" },
+            ].map((item) => (
+              <button
+                key={item.key}
+                type="button"
+                onClick={() => setPublishMode(item.key as "manual" | "auto")}
+                disabled={!canEditPublishMode || updatePublishMode.isPending}
+                className={`flex-1 rounded-lg px-3 py-1.5 text-[11px] font-medium transition-colors ${
+                  activePublishMode === item.key
+                    ? "bg-background text-foreground shadow-sm"
+                    : "text-muted-foreground hover:text-foreground"
+                } ${!canEditPublishMode ? "cursor-not-allowed opacity-60" : ""}`}
+              >
+                {item.label}
+              </button>
+            ))}
+          </div>
+          <p className="mt-1.5 text-[11px] text-muted-foreground leading-snug">{MODE_DESCRIPTIONS[activePublishMode]}</p>
+          {publishCounts && (
+            <div className="mt-2 flex flex-wrap gap-x-3 text-[11px] text-muted-foreground">
+              <span className={publishCounts.today >= publishCounts.today_limit ? "text-red-600 font-medium" : ""}>
+                Today: {publishCounts.today}/{publishCounts.today_limit}
+              </span>
+              <span className={publishCounts.week >= publishCounts.week_limit ? "text-red-600 font-medium" : ""}>
+                Week: {publishCounts.week}/{publishCounts.week_limit}
+              </span>
+              {nextScheduledRun && (
+                <span>Next run: {new Date(nextScheduledRun).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
+              )}
+            </div>
+          )}
           {pipeline?.current_step_label && <div className="mt-2 text-sm text-muted-foreground">{pipeline.current_step_label}</div>}
 
           {isPipelineRunning && (
@@ -244,8 +372,15 @@ export function Dashboard() {
               {showClaudeBilling && (
                 <div className="mt-2 rounded-xl border border-border bg-background/80 p-2">
                   <div className="text-[11px] uppercase tracking-[0.16em] text-muted-foreground">Claude Billing</div>
-                  <div className={`mt-1 text-xs ${needsBillingAttention ? "text-amber-700" : "text-muted-foreground"}`}>
-                    {needsBillingAttention ? "Low credits or billing issue detected." : "Manage Claude credits and invoices."}
+                  <div className={`mt-1 text-xs font-medium ${balanceBadgeClass}`}>
+                    {aiBalanceLoading
+                      ? "Balance: loading..."
+                      : balanceUsd === null
+                        ? "Balance unavailable"
+                        : `Balance: $${balanceUsd.toFixed(2)}`}
+                  </div>
+                  <div className="mt-1 text-xs text-muted-foreground">
+                    {aiBalance?.message || (needsBillingAttention ? "Low credits or billing issue detected." : "Manage Claude credits and invoices.")}
                   </div>
                   <a
                     href="https://platform.claude.com/settings/billing"
@@ -253,7 +388,7 @@ export function Dashboard() {
                     rel="noreferrer"
                     className="mt-2 inline-flex items-center gap-1 rounded-lg border border-border px-2 py-1 text-[11px] font-medium hover:bg-accent"
                   >
-                    {needsBillingAttention ? "Recharge Now" : "Open Billing"}
+                    {showRechargeNow ? "Recharge Now" : "Open Billing"}
                     <ExternalLink className="h-3 w-3" />
                   </a>
                 </div>
@@ -303,7 +438,9 @@ export function Dashboard() {
           <div>
             <h2 className="text-lg font-semibold">Pipeline Trace</h2>
             <p className="text-sm text-muted-foreground">
-              This shows which stages succeeded, which one failed or warned, and why Approvals may still be empty.
+              Last attempt — {pipeline?.id ? `Run #${pipeline.id}` : "no runs yet"}
+              {pipeline?.started_at ? ` · started ${new Date(pipeline.started_at).toLocaleString()}` : ""}
+              {pipeline?.trigger ? ` · ${formatTriggerLabel(pipeline.trigger)}` : ""}
             </p>
           </div>
           <div className="inline-flex items-center gap-2 rounded-full bg-muted px-3 py-1.5 text-xs text-muted-foreground">

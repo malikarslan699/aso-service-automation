@@ -163,6 +163,36 @@ export function AsoOverview({ publicView = false }: OverviewProps) {
 
       <section className="panel p-6">
         <div className="mb-4 flex items-center gap-2">
+          <Rocket className="h-4 w-4 text-primary" />
+          <h2 className="text-xl font-semibold">Publish Modes</h2>
+        </div>
+        <div className="grid gap-4 md:grid-cols-2">
+          <div className="rounded-xl border border-border bg-background/60 p-4 space-y-2">
+            <div className="flex items-center gap-2">
+              <span className="rounded-full bg-blue-100 px-2 py-0.5 text-xs font-semibold text-blue-700">Manual</span>
+            </div>
+            <p className="text-sm text-muted-foreground">
+              AI generates suggestions — you approve each one before anything goes <strong>live on Google Play</strong>. Full human control. Nothing publishes without your action.
+            </p>
+            <p className="text-xs text-muted-foreground italic">Best for: supervised publishing where you review every change.</p>
+          </div>
+          <div className="rounded-xl border border-border bg-background/60 p-4 space-y-2">
+            <div className="flex items-center gap-2">
+              <span className="rounded-full bg-indigo-100 px-2 py-0.5 text-xs font-semibold text-indigo-700">Auto</span>
+            </div>
+            <p className="text-sm text-muted-foreground">
+              Fully automated. AI generates → auto-approves → publishes live with <strong>random human-like timing</strong> and daily/weekly publish limits. No manual action needed.
+            </p>
+            <p className="text-xs text-muted-foreground italic">Best for: set-and-forget once you trust AI quality and limits.</p>
+          </div>
+        </div>
+        <p className="mt-3 text-xs text-muted-foreground">
+          All modes respect the 9AM–10PM UTC publish window when human-like timing is enabled. Publishes outside the window are held and retried automatically on the next hour.
+        </p>
+      </section>
+
+      <section className="panel p-6">
+        <div className="mb-4 flex items-center gap-2">
           <CheckCircle2 className="h-4 w-4 text-primary" />
           <h2 className="text-xl font-semibold">Suggestion States</h2>
         </div>

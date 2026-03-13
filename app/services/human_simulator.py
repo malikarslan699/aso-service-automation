@@ -17,53 +17,73 @@ def is_publish_window() -> bool:
     return PUBLISH_WINDOW_START <= now.hour < PUBLISH_WINDOW_END
 
 
-async def pipeline_delay(dry_run: bool = False) -> None:
+def compute_pipeline_delay_seconds(dry_run: bool = False, enabled: bool = True, min_minutes: int = 5, max_minutes: int = 20) -> int:
+    if dry_run or not enabled:
+        return 0
+    lo = max(1, min_minutes) * 60
+    hi = max(lo, max_minutes * 60)
+    return random.randint(lo, hi)
+
+
+def compute_publish_delay_seconds(dry_run: bool = False, enabled: bool = True, min_minutes: int = 45, max_minutes: int = 180) -> int:
+    if dry_run or not enabled:
+        return 0
+    lo = max(1, min_minutes) * 60
+    hi = max(lo, max_minutes * 60)
+    return random.randint(lo, hi)
+
+
+async def pipeline_delay(dry_run: bool = False, enabled: bool = True, delay_seconds: int | None = None) -> int:
     """Wait a random 5-20 minute delay before running pipeline steps.
 
     In dry_run mode: no delay (for fast testing).
     """
-    if dry_run:
-        logger.debug("pipeline_delay: skipped (dry_run=True)")
-        return
+    resolved_delay = compute_pipeline_delay_seconds(dry_run=dry_run, enabled=enabled) if delay_seconds is None else max(delay_seconds, 0)
+    if resolved_delay <= 0:
+        logger.debug("pipeline_delay: skipped (dry_run=%s, enabled=%s)", dry_run, enabled)
+        return 0
 
-    delay_seconds = random.randint(5 * 60, 20 * 60)  # 5-20 minutes
-    logger.info(f"Human simulation: pipeline delay {delay_seconds // 60} minutes")
-    await asyncio.sleep(delay_seconds)
+    logger.info("Human simulation: pipeline delay %s minutes", resolved_delay // 60)
+    await asyncio.sleep(resolved_delay)
+    return resolved_delay
 
 
-def pipeline_delay_sync(dry_run: bool = False) -> None:
+def pipeline_delay_sync(dry_run: bool = False, enabled: bool = True, delay_seconds: int | None = None) -> int:
     """Sync version of pipeline_delay for use in Celery tasks."""
     import time
 
-    if dry_run:
-        return
+    resolved_delay = compute_pipeline_delay_seconds(dry_run=dry_run, enabled=enabled) if delay_seconds is None else max(delay_seconds, 0)
+    if resolved_delay <= 0:
+        return 0
 
-    delay_seconds = random.randint(5 * 60, 20 * 60)
-    logger.info(f"Human simulation: pipeline delay {delay_seconds // 60} minutes")
-    time.sleep(delay_seconds)
+    logger.info("Human simulation: pipeline delay %s minutes", resolved_delay // 60)
+    time.sleep(resolved_delay)
+    return resolved_delay
 
 
-async def publish_delay(dry_run: bool = False) -> None:
+async def publish_delay(dry_run: bool = False, enabled: bool = True, delay_seconds: int | None = None) -> int:
     """Wait a random 45 min - 3 hour delay before publishing.
 
     In dry_run mode: no delay.
     """
-    if dry_run:
-        logger.debug("publish_delay: skipped (dry_run=True)")
-        return
+    resolved_delay = compute_publish_delay_seconds(dry_run=dry_run, enabled=enabled) if delay_seconds is None else max(delay_seconds, 0)
+    if resolved_delay <= 0:
+        logger.debug("publish_delay: skipped (dry_run=%s, enabled=%s)", dry_run, enabled)
+        return 0
 
-    delay_seconds = random.randint(45 * 60, 3 * 60 * 60)  # 45 min - 3 hours
-    logger.info(f"Human simulation: publish delay {delay_seconds // 60} minutes")
-    await asyncio.sleep(delay_seconds)
+    logger.info("Human simulation: publish delay %s minutes", resolved_delay // 60)
+    await asyncio.sleep(resolved_delay)
+    return resolved_delay
 
 
-def publish_delay_sync(dry_run: bool = False) -> None:
+def publish_delay_sync(dry_run: bool = False, enabled: bool = True, delay_seconds: int | None = None) -> int:
     """Sync version of publish_delay for Celery tasks."""
     import time
 
-    if dry_run:
-        return
+    resolved_delay = compute_publish_delay_seconds(dry_run=dry_run, enabled=enabled) if delay_seconds is None else max(delay_seconds, 0)
+    if resolved_delay <= 0:
+        return 0
 
-    delay_seconds = random.randint(45 * 60, 3 * 60 * 60)
-    logger.info(f"Human simulation: publish delay {delay_seconds // 60} minutes")
-    time.sleep(delay_seconds)
+    logger.info("Human simulation: publish delay %s minutes", resolved_delay // 60)
+    time.sleep(resolved_delay)
+    return resolved_delay

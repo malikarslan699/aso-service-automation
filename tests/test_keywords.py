@@ -2,6 +2,7 @@
 import pytest
 from app.services.keywords.keyword_extractor import extract_keywords, extract_from_competitors
 from app.services.keywords.opportunity_scorer import score_keyword, rank_keywords
+from app.models.keyword import Keyword
 
 
 # --- keyword_extractor tests ---
@@ -131,3 +132,37 @@ def test_rank_keywords_respects_top_n():
     frequencies = {f"keyword_{i}": i for i in range(1, 20)}
     ranked = rank_keywords(frequencies, [], [], top_n=5)
     assert len(ranked) == 5
+
+
+@pytest.mark.asyncio
+async def test_keywords_page_limit_returns_envelope(client, auth_headers):
+    create_app = await client.post(
+        "/api/v1/apps",
+        json={"name": "Keywords Paging App", "package_name": "com.keywords.page"},
+        headers=auth_headers,
+    )
+    assert create_app.status_code == 201
+    app_id = create_app.json()["id"]
+
+    from tests.conftest import test_session
+
+    async with test_session() as session:
+        for idx in range(3):
+            session.add(
+                Keyword(
+                    app_id=app_id,
+                    keyword=f"keyword-{idx}",
+                    source="manual",
+                    opportunity_score=float(idx + 1),
+                    status="active",
+                )
+            )
+        await session.commit()
+
+    resp = await client.get(f"/api/v1/apps/{app_id}/keywords?page=2&limit=2", headers=auth_headers)
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["page"] == 2
+    assert data["limit"] == 2
+    assert data["total"] == 3
+    assert len(data["items"]) == 1

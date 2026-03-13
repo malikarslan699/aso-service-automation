@@ -32,6 +32,7 @@ async def list_logs(
     module: Optional[str] = Query(None),
     app_id: Optional[int] = Query(None),
     limit: int = Query(50, le=200),
+    page: Optional[int] = Query(None, ge=1),
     db: AsyncSession = Depends(get_db),
     user: User = Depends(require_any_role("admin", "sub_admin")),
 ):
@@ -49,13 +50,36 @@ async def list_logs(
         accessible_app_ids = await _accessible_app_ids(db, user)
         if not accessible_app_ids:
             return []
-        query = query.where(SystemLog.app_id.in_(accessible_app_ids))
+        else:
+            # include logs with no app_id (system-level) + accessible app logs
+            from sqlalchemy import or_
+            query = query.where(
+                or_(SystemLog.app_id.is_(None), SystemLog.app_id.in_(accessible_app_ids))
+            )
 
-    query = query.limit(limit)
+    total = None
+    if page is not None:
+        count_query = select(SystemLog.id)
+        if level:
+            count_query = count_query.where(SystemLog.level == level)
+        if module:
+            count_query = count_query.where(SystemLog.module == module)
+        if app_id is not None:
+            count_query = count_query.where(SystemLog.app_id == app_id)
+        else:
+            accessible_app_ids = await _accessible_app_ids(db, user)
+            if not accessible_app_ids:
+                return {"items": [], "total": 0, "page": page, "limit": limit, "has_more": False}
+            count_query = count_query.where(SystemLog.app_id.in_(accessible_app_ids))
+        total = len((await db.execute(count_query)).scalars().all())
+        query = query.offset((page - 1) * limit).limit(limit)
+    else:
+        query = query.limit(limit)
+
     result = await db.execute(query)
     logs = result.scalars().all()
 
-    return [
+    payload = [
         {
             "id": log.id,
             "app_id": log.app_id,
@@ -67,6 +91,17 @@ async def list_logs(
         }
         for log in logs
     ]
+
+    if page is None:
+        return payload
+
+    return {
+        "items": payload,
+        "total": total or 0,
+        "page": page,
+        "limit": limit,
+        "has_more": (page * limit) < (total or 0),
+    }
 
 
 @router.delete("")

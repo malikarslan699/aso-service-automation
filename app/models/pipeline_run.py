@@ -27,5 +27,6 @@ class PipelineRun(Base, AppScopedMixin, TimestampMixin):
     value_summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     step_log: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    celery_task_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     started_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)

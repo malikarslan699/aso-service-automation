@@ -117,3 +117,37 @@ async def test_sub_admin_can_clear_own_app_logs(client, auth_headers):
     clear = await client.delete(f"/api/v1/logs?app_id={own_app_id}", headers=sub_headers)
     assert clear.status_code == 200
     assert clear.json()["status"] == "ok"
+
+
+async def test_logs_page_limit_returns_envelope(client, auth_headers):
+    create_app = await client.post(
+        "/api/v1/apps",
+        json={"name": "Logs Paging App", "package_name": "com.logs.paging"},
+        headers=auth_headers,
+    )
+    assert create_app.status_code == 201
+    app_id = create_app.json()["id"]
+
+    from tests.conftest import test_session
+
+    async with test_session() as session:
+        for idx in range(3):
+            session.add(
+                SystemLog(
+                    level="info",
+                    module="paging_test",
+                    message=f"log-{idx}",
+                    details="{}",
+                    app_id=app_id,
+                    created_at=datetime.now(timezone.utc).replace(tzinfo=None),
+                )
+            )
+        await session.commit()
+
+    resp = await client.get(f"/api/v1/logs?app_id={app_id}&page=2&limit=2", headers=auth_headers)
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["page"] == 2
+    assert data["limit"] == 2
+    assert data["total"] == 3
+    assert len(data["items"]) == 1

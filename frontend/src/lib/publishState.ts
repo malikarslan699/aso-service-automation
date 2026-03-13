@@ -39,6 +39,8 @@ export function getPublishBadge(suggestion: SuggestionRecord) {
       return { label: "Publishing to Google", classes: "text-blue-700 bg-blue-50 border-blue-200" }
     case "published":
       return { label: "Published on Google", classes: "text-green-700 bg-green-50 border-green-200" }
+    case "soft_published":
+      return { label: "Soft Published (Draft Edit)", classes: "text-emerald-700 bg-emerald-50 border-emerald-200" }
     case "dry_run_only":
       return { label: "Dry Run Only", classes: "text-amber-700 bg-amber-50 border-amber-200" }
     case "blocked":
@@ -68,6 +70,7 @@ export function getPublishCounterKey(suggestion: SuggestionRecord) {
     case "waiting_safe_window":
       return "queued"
     case "published":
+    case "soft_published":
       return "published"
     case "dry_run_only":
       return "dryRun"

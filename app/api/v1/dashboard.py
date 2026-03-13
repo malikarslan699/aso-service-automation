@@ -1,4 +1,5 @@
 """Dashboard endpoint: pipeline status, health, and summary."""
+from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, or_
@@ -10,8 +11,9 @@ from app.models.suggestion import Suggestion
 from app.models.keyword import Keyword
 from app.models.app import App
 from app.models.user_app_access import UserAppAccess
+from app.models.listing_publish_job import ListingPublishJob
 from app.services.pipeline_tracking import current_step_label, parse_step_log
-from app.services.runtime_config import is_true, load_runtime_config
+from app.services.runtime_config import as_int, is_true, load_runtime_config
 
 router = APIRouter()
 
@@ -23,19 +25,17 @@ async def get_dashboard(
 ):
     """Return dashboard summary: latest pipeline runs, suggestion counts, health, and mode flags."""
 
-    # --- Load apps accessible to this user ---
-    app_query = select(App).order_by(App.id)
-    if user.role in {"admin", "sub_admin"}:
-        app_query = (
-            select(App)
-            .outerjoin(
-                UserAppAccess,
-                (UserAppAccess.app_id == App.id) & (UserAppAccess.user_id == user.id),
-            )
-            .where(or_(App.owner_user_id == user.id, UserAppAccess.user_id == user.id))
-            .order_by(App.id)
-            .distinct()
+    # --- Load apps accessible to this user (owned or explicitly assigned) ---
+    app_query = (
+        select(App)
+        .outerjoin(
+            UserAppAccess,
+            (UserAppAccess.app_id == App.id) & (UserAppAccess.user_id == user.id),
         )
+        .where(or_(App.owner_user_id == user.id, UserAppAccess.user_id == user.id))
+        .order_by(App.id)
+        .distinct()
+    )
     apps_result = await db.execute(app_query)
     apps = apps_result.scalars().all()
     app_ids = [a.id for a in apps]
@@ -45,7 +45,7 @@ async def get_dashboard(
             "apps": [],
             "total_pending_suggestions": 0,
             "health": {"database": "ok", "api": "ok"},
-            "mode": {"dry_run": True, "manual_approval_required": True},
+            "mode": {"dry_run": True, "manual_approval_required": True, "publish_mode": "live"},
         }
 
     # --- Bulk: latest pipeline run per app (one query) ---
@@ -91,6 +91,39 @@ async def get_dashboard(
     config = await db.run_sync(load_runtime_config)
     dry_run_mode = is_true(config.get("dry_run"), True)
     manual_approval_required = is_true(config.get("manual_approval_required"), True)
+    publish_mode = (config.get("publish_mode") or "live").strip().lower()
+    if publish_mode not in {"soft", "live"}:
+        publish_mode = "live"
+
+    # --- Publish counts (today + week) across all accessible apps ---
+    now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+    day_start = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+    week_start = day_start - timedelta(days=day_start.weekday())
+    max_per_day = as_int(config.get("listing_publish_max_per_day"), as_int(config.get("max_publish_per_day"), 1))
+    max_per_week = as_int(config.get("listing_publish_max_per_week"), as_int(config.get("max_publish_per_week"), 5))
+
+    today_count_result = await db.execute(
+        select(func.count())
+        .select_from(ListingPublishJob)
+        .where(ListingPublishJob.app_id.in_(app_ids))
+        .where(ListingPublishJob.status.in_(("published", "dry_run_only")))
+        .where(ListingPublishJob.executed_at >= day_start)
+    )
+    week_count_result = await db.execute(
+        select(func.count())
+        .select_from(ListingPublishJob)
+        .where(ListingPublishJob.app_id.in_(app_ids))
+        .where(ListingPublishJob.status.in_(("published", "dry_run_only")))
+        .where(ListingPublishJob.executed_at >= week_start)
+    )
+    publish_today = today_count_result.scalar() or 0
+    publish_week = week_count_result.scalar() or 0
+
+    # Next scheduled run: 8:55 AM UTC tomorrow (if today's already passed) or today
+    next_run_dt = now_utc.replace(hour=8, minute=55, second=0, microsecond=0)
+    if next_run_dt <= now_utc:
+        next_run_dt = next_run_dt + timedelta(days=1)
+    next_scheduled_run = next_run_dt.replace(tzinfo=timezone.utc).isoformat()
 
     # --- Build per-app summaries ---
     pipeline_summaries = []
@@ -143,5 +176,13 @@ async def get_dashboard(
         "mode": {
             "dry_run": dry_run_mode,
             "manual_approval_required": manual_approval_required,
+            "publish_mode": publish_mode,
         },
+        "publish_counts": {
+            "today": publish_today,
+            "today_limit": max_per_day,
+            "week": publish_week,
+            "week_limit": max_per_week,
+        },
+        "next_scheduled_run": next_scheduled_run,
     }

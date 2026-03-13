@@ -22,6 +22,12 @@ DEFAULTS = {
     "auto_approve_threshold": "0",
     "manual_approval_required": "true",
     "publish_after_approval": "true",
+    "publish_mode": "live",
+    "human_sim_enabled": "false",
+    "pipeline_delay_min_minutes": "5",
+    "pipeline_delay_max_minutes": "20",
+    "publish_delay_min_minutes": "45",
+    "publish_delay_max_minutes": "180",
     "manual_trigger_cooldown_minutes": "15",
     "openai_api_key": "",
 }

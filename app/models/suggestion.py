@@ -33,3 +33,4 @@ class Suggestion(Base, AppScopedMixin, TimestampMixin):
     dispatch_window: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
     next_eligible_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     publish_block_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    google_play_edit_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)

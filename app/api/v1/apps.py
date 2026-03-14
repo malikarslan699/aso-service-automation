@@ -81,11 +81,27 @@ async def update_app(
     app = await ensure_app_access(db, user, app_id)
     if data.name is not None:
         app.name = data.name
+    if data.package_name is not None:
+        existing = await db.execute(select(App).where(App.package_name == data.package_name, App.id != app_id))
+        if existing.scalar_one_or_none():
+            raise HTTPException(status_code=400, detail="Package name already used by another project")
+        app.package_name = data.package_name
     if data.status is not None and user.role == "admin":
         app.status = data.status
     await db.commit()
     await db.refresh(app)
     return app
+
+
+@router.delete("/{app_id}", status_code=204)
+async def delete_app(
+    app_id: int,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_role("admin")),
+):
+    app = await ensure_app_access(db, user, app_id)
+    await db.delete(app)
+    await db.commit()
 
 
 @router.post("/{app_id}/credentials")

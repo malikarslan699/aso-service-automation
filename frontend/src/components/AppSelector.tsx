@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react"
 import { useMutation } from "@tanstack/react-query"
-import { ChevronDown, FolderKanban, Plus, Search, X } from "lucide-react"
+import { ChevronDown, FolderKanban, Pencil, Plus, Search, Trash2, X } from "lucide-react"
 
 import api from "@/lib/api"
 import { useAuth } from "@/hooks/useAuth"
@@ -11,10 +11,24 @@ function extractErrorMessage(error: unknown, fallback: string): string {
   return fallback
 }
 
+function parsePackageName(raw: string): string {
+  const s = raw.trim()
+  if (s.includes("play.google.com") || s.startsWith("http")) {
+    try {
+      const params = new URLSearchParams(new URL(s).search)
+      const id = params.get("id")
+      if (id) return id.trim()
+    } catch {}
+  }
+  return s
+}
+
 export function AppSelector() {
   const { apps, selectedApp, setSelectedApp, refreshApps, user } = useAuth()
   const [open, setOpen] = useState(false)
   const [showCreate, setShowCreate] = useState(false)
+  const [editingPkg, setEditingPkg] = useState<{ id: number; value: string } | null>(null)
+  const [confirmDelete, setConfirmDelete] = useState<number | null>(null)
   const [search, setSearch] = useState("")
   const [form, setForm] = useState({ name: "", package_name: "", store: "google_play" })
 
@@ -35,6 +49,25 @@ export function AppSelector() {
       setOpen(false)
       await refreshApps()
       setSelectedApp(created)
+    },
+  })
+
+  const updatePkg = useMutation({
+    mutationFn: ({ id, pkg }: { id: number; pkg: string }) =>
+      api.patch(`/api/v1/apps/${id}`, { package_name: pkg }).then((r) => r.data),
+    onSuccess: async (updated) => {
+      setEditingPkg(null)
+      await refreshApps()
+      if (selectedApp?.id === updated.id) setSelectedApp(updated)
+    },
+  })
+
+  const deleteApp = useMutation({
+    mutationFn: (id: number) => api.delete(`/api/v1/apps/${id}`),
+    onSuccess: async (_, id) => {
+      setConfirmDelete(null)
+      await refreshApps()
+      if (selectedApp?.id === id) setSelectedApp(null as any)
     },
   })
 
@@ -76,19 +109,96 @@ export function AppSelector() {
               <div className="rounded-xl px-3 py-4 text-sm text-muted-foreground">No visible projects match your search.</div>
             ) : (
               filteredApps.map((app) => (
-                <button
-                  key={app.id}
-                  onClick={() => {
-                    setSelectedApp(app)
-                    setOpen(false)
-                  }}
-                  className={`w-full rounded-xl px-4 py-3 text-left text-sm transition-colors hover:bg-accent ${
-                    selectedApp?.id === app.id ? "bg-accent/70 font-medium text-primary" : ""
-                  }`}
-                >
-                  <div className="truncate font-medium">{app.name}</div>
-                  <div className="truncate text-xs text-muted-foreground">{app.package_name}</div>
-                </button>
+                <div key={app.id} className="group relative">
+                  {editingPkg?.id === app.id ? (
+                    <div className="rounded-xl border border-border bg-accent/30 px-4 py-3">
+                      <div className="mb-1 text-sm font-medium">{app.name}</div>
+                      <input
+                        autoFocus
+                        value={editingPkg.value}
+                        onChange={(e) => setEditingPkg({ id: app.id, value: parsePackageName(e.target.value) })}
+                        onPaste={(e) => {
+                          e.preventDefault()
+                          const pasted = e.clipboardData.getData("text")
+                          setEditingPkg({ id: app.id, value: parsePackageName(pasted) })
+                        }}
+                        placeholder="com.company.app or paste Play Store URL"
+                        className="w-full rounded-xl border border-input bg-background px-3 py-2 text-xs focus:outline-none focus:ring-2 focus:ring-ring"
+                      />
+                      {updatePkg.isError && (
+                        <p className="mt-1 text-[11px] text-destructive">
+                          {extractErrorMessage(updatePkg.error, "Invalid package name")}
+                        </p>
+                      )}
+                      <div className="mt-2 flex gap-2">
+                        <button
+                          onClick={() => updatePkg.mutate({ id: app.id, pkg: editingPkg.value })}
+                          disabled={updatePkg.isPending || !editingPkg.value.trim()}
+                          className="rounded-lg bg-primary px-3 py-1.5 text-[11px] font-medium text-primary-foreground disabled:opacity-50"
+                        >
+                          {updatePkg.isPending ? "Saving..." : "Save"}
+                        </button>
+                        <button
+                          onClick={() => setEditingPkg(null)}
+                          className="rounded-lg border border-border px-3 py-1.5 text-[11px] hover:bg-accent"
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <button
+                      onClick={() => { setSelectedApp(app); setOpen(false) }}
+                      className={`w-full rounded-xl px-4 py-3 text-left text-sm transition-colors hover:bg-accent ${
+                        selectedApp?.id === app.id ? "bg-accent/70 font-medium text-primary" : ""
+                      }`}
+                    >
+                      <div className="truncate font-medium">{app.name}</div>
+                      <div className="truncate text-xs text-muted-foreground">{app.package_name}</div>
+                    </button>
+                  )}
+                  {canCreate && editingPkg?.id !== app.id && confirmDelete !== app.id && (
+                    <div className="absolute right-2 top-1/2 flex -translate-y-1/2 gap-1 opacity-0 transition-opacity group-hover:opacity-100">
+                      <button
+                        onClick={(e) => { e.stopPropagation(); setEditingPkg({ id: app.id, value: app.package_name }) }}
+                        className="rounded-lg p-1.5 hover:bg-accent"
+                        title="Edit package name"
+                      >
+                        <Pencil className="h-3 w-3 text-muted-foreground" />
+                      </button>
+                      {user?.role === "admin" && (
+                        <button
+                          onClick={(e) => { e.stopPropagation(); setConfirmDelete(app.id) }}
+                          className="rounded-lg p-1.5 hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-950"
+                          title="Delete project"
+                        >
+                          <Trash2 className="h-3 w-3 text-muted-foreground" />
+                        </button>
+                      )}
+                    </div>
+                  )}
+                  {confirmDelete === app.id && (
+                    <div className="absolute inset-x-0 top-0 z-10 rounded-xl border border-red-200 bg-background px-4 py-3 shadow-md">
+                      <p className="text-sm font-medium text-destructive">Delete "{app.name}"?</p>
+                      <p className="mt-0.5 text-[11px] text-muted-foreground">This will remove all data permanently.</p>
+                      <div className="mt-2 flex gap-2">
+                        <button
+                          onClick={(e) => { e.stopPropagation(); deleteApp.mutate(app.id) }}
+                          disabled={deleteApp.isPending}
+                          className="rounded-lg bg-red-600 px-3 py-1.5 text-[11px] font-medium text-white disabled:opacity-50 hover:bg-red-700"
+                        >
+                          {deleteApp.isPending ? "Deleting..." : "Delete"}
+                        </button>
+                        <button
+                          onClick={(e) => { e.stopPropagation(); setConfirmDelete(null) }}
+                          className="rounded-lg border border-border px-3 py-1.5 text-[11px] hover:bg-accent"
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
               ))
             )}
           </div>
@@ -134,12 +244,20 @@ export function AppSelector() {
                 placeholder="Project name"
                 className="w-full rounded-2xl border border-input bg-background px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
               />
-              <input
-                value={form.package_name}
-                onChange={(event) => setForm((current) => ({ ...current, package_name: event.target.value }))}
-                placeholder="Package name"
-                className="w-full rounded-2xl border border-input bg-background px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-              />
+              <div>
+                <input
+                  value={form.package_name}
+                  onChange={(e) => setForm((c) => ({ ...c, package_name: parsePackageName(e.target.value) }))}
+                  onPaste={(e) => {
+                    e.preventDefault()
+                    const pasted = e.clipboardData.getData("text")
+                    setForm((c) => ({ ...c, package_name: parsePackageName(pasted) }))
+                  }}
+                  placeholder="com.company.app or paste Play Store URL"
+                  className="w-full rounded-2xl border border-input bg-background px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+                />
+                <p className="mt-1 px-1 text-[11px] text-muted-foreground">Paste Play Store URL — package name auto-extracted</p>
+              </div>
               <select
                 value={form.store}
                 onChange={(event) => setForm((current) => ({ ...current, store: event.target.value }))}
